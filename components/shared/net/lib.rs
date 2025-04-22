@@ -953,7 +953,7 @@ pub enum NetworkError {
     MixedContent,
     CacheError,
     InvalidPort,
-    LocalDirectoryError, 
+    LocalDirectoryError,
 }
 
 impl NetworkError {
