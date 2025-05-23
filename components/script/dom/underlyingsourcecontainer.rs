@@ -20,7 +20,8 @@ use crate::dom::defaultteeunderlyingsource::DefaultTeeUnderlyingSource;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
 use crate::dom::promise::Promise;
-use crate::script_runtime::CanGc;
+use crate::dom::transformstream::TransformStream;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 /// <https://streams.spec.whatwg.org/#underlying-source-api>
 /// The `Js` variant corresponds to
@@ -43,6 +44,10 @@ pub(crate) enum UnderlyingSourceType {
     Tee(Dom<DefaultTeeUnderlyingSource>),
     /// Transfer, with the port used in some of the algorithms.
     Transfer(Dom<MessagePort>),
+    /// A struct representing a JS object as underlying source,
+    /// and the actual JS object for use as `thisArg` in callbacks.
+    /// This is used for the `TransformStream` API.
+    Transform(Dom<TransformStream>, Rc<Promise>),
 }
 
 impl UnderlyingSourceType {
@@ -110,6 +115,8 @@ impl UnderlyingSourceContainer {
     #[allow(unsafe_code)]
     pub(crate) fn call_cancel_algorithm(
         &self,
+        cx: SafeJSContext,
+        global: &GlobalScope,
         reason: SafeHandleValue,
         can_gc: CanGc,
     ) -> Option<Result<Rc<Promise>, Error>> {
@@ -128,9 +135,13 @@ impl UnderlyingSourceContainer {
                 }
                 None
             },
-            UnderlyingSourceType::Tee(tee_underlyin_source) => {
+            UnderlyingSourceType::Tee(tee_underlying_source) => {
                 // Call the cancel algorithm for the appropriate branch.
-                tee_underlyin_source.cancel_algorithm(reason, can_gc)
+                tee_underlying_source.cancel_algorithm(cx, global, reason, can_gc)
+            },
+            UnderlyingSourceType::Transform(stream, _) => {
+                // Return ! TransformStreamDefaultSourceCancelAlgorithm(stream, reason).
+                Some(stream.transform_stream_default_source_cancel(cx, global, reason, can_gc))
             },
             UnderlyingSourceType::Transfer(port) => {
                 // Let cancelAlgorithm be the following steps, taking a reason argument:
@@ -140,7 +151,7 @@ impl UnderlyingSourceContainer {
                 let result = port.pack_and_post_message_handling_error("error", reason, can_gc);
 
                 // Disentangle port.
-                self.global().disentangle_port(port);
+                self.global().disentangle_port(port, can_gc);
 
                 let promise = Promise::new(&self.global(), can_gc);
 
@@ -163,6 +174,7 @@ impl UnderlyingSourceContainer {
     pub(crate) fn call_pull_algorithm(
         &self,
         controller: Controller,
+        _global: &GlobalScope,
         can_gc: CanGc,
     ) -> Option<Result<Rc<Promise>, Error>> {
         match &self.underlying_source_type {
@@ -180,9 +192,9 @@ impl UnderlyingSourceContainer {
                 }
                 None
             },
-            UnderlyingSourceType::Tee(tee_underlyin_source) => {
+            UnderlyingSourceType::Tee(tee_underlying_source) => {
                 // Call the pull algorithm for the appropriate branch.
-                Some(Ok(tee_underlyin_source.pull_algorithm(can_gc)))
+                Some(Ok(tee_underlying_source.pull_algorithm(can_gc)))
             },
             UnderlyingSourceType::Transfer(port) => {
                 // Let pullAlgorithm be the following steps:
@@ -201,6 +213,10 @@ impl UnderlyingSourceContainer {
                 Some(Ok(promise))
             },
             // Note: other source type have no pull steps for now.
+            UnderlyingSourceType::Transform(stream, _) => {
+                // Return ! TransformStreamDefaultSourcePullAlgorithm(stream).
+                Some(stream.transform_stream_default_source_pull(&self.global(), can_gc))
+            },
             _ => None,
         }
     }
@@ -263,6 +279,10 @@ impl UnderlyingSourceContainer {
                 // Let startAlgorithm be an algorithm that returns undefined.
                 // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable
                 None
+            },
+            UnderlyingSourceType::Transform(_, start_promise) => {
+                // Let startAlgorithm be an algorithm that returns startPromise.
+                Some(Ok(start_promise.clone()))
             },
             _ => None,
         }

@@ -5,17 +5,16 @@
 use app_units::Au;
 use base::print_tree::PrintTree;
 use compositing_traits::display_list::AxesScrollSensitivity;
-use euclid::default::{Point2D, Rect, Size2D};
+use euclid::default::Size2D;
 use fxhash::FxHashSet;
 use malloc_size_of_derive::MallocSizeOf;
 use style::animation::AnimationSetKey;
-use style::dom::OpaqueNode;
 use webrender_api::units;
 
-use super::{ContainingBlockManager, Fragment, Tag};
-use crate::display_list::StackingContext;
-use crate::flow::CanvasBackground;
-use crate::geom::{PhysicalPoint, PhysicalRect};
+use super::{BoxFragment, ContainingBlockManager, Fragment};
+use crate::ArcRefCell;
+use crate::context::LayoutContext;
+use crate::geom::PhysicalRect;
 
 #[derive(MallocSizeOf)]
 pub struct FragmentTree {
@@ -36,26 +35,59 @@ pub struct FragmentTree {
     /// The containing block used in the layout of this fragment tree.
     pub(crate) initial_containing_block: PhysicalRect<Au>,
 
-    /// <https://drafts.csswg.org/css-backgrounds/#special-backgrounds>
-    pub(crate) canvas_background: CanvasBackground,
-
     /// Whether or not the viewport is sensitive to scroll input events.
     pub viewport_scroll_sensitivity: AxesScrollSensitivity,
 }
 
 impl FragmentTree {
-    pub(crate) fn build_display_list(
-        &self,
-        builder: &mut crate::display_list::DisplayListBuilder,
-        root_stacking_context: &StackingContext,
-    ) {
-        // Paint the canvas’ background (if any) before/under everything else
-        root_stacking_context.build_canvas_background_display_list(
-            builder,
-            self,
-            &self.initial_containing_block,
-        );
-        root_stacking_context.build_display_list(builder);
+    pub(crate) fn new(
+        layout_context: &LayoutContext,
+        root_fragments: Vec<Fragment>,
+        scrollable_overflow: PhysicalRect<Au>,
+        initial_containing_block: PhysicalRect<Au>,
+        viewport_scroll_sensitivity: AxesScrollSensitivity,
+    ) -> Self {
+        let fragment_tree = Self {
+            root_fragments,
+            scrollable_overflow,
+            initial_containing_block,
+            viewport_scroll_sensitivity,
+        };
+
+        // As part of building the fragment tree, we want to stop animating elements and
+        // pseudo-elements that used to be animating or had animating images attached to
+        // them. Create a set of all elements that used to be animating.
+        let mut animations = layout_context.style_context.animations.sets.write();
+        let mut invalid_animating_nodes: FxHashSet<_> = animations.keys().cloned().collect();
+        let mut image_animations = layout_context.node_image_animation_map.write().to_owned();
+        let mut invalid_image_animating_nodes: FxHashSet<_> = image_animations
+            .keys()
+            .cloned()
+            .map(|node| AnimationSetKey::new(node, None))
+            .collect();
+
+        fragment_tree.find(|fragment, _level, containing_block| {
+            if let Some(tag) = fragment.tag() {
+                invalid_animating_nodes.remove(&AnimationSetKey::new(tag.node, tag.pseudo));
+                invalid_image_animating_nodes.remove(&AnimationSetKey::new(tag.node, tag.pseudo));
+            }
+
+            fragment.set_containing_block(containing_block);
+            None::<()>
+        });
+
+        // Cancel animations for any elements and pseudo-elements that are no longer found
+        // in the fragment tree.
+        for node in &invalid_animating_nodes {
+            if let Some(state) = animations.get_mut(node) {
+                state.cancel_all_animations();
+            }
+        }
+        for node in &invalid_image_animating_nodes {
+            image_animations.remove(&node.node);
+        }
+
+        fragment_tree
     }
 
     pub fn print(&self) {
@@ -86,109 +118,67 @@ impl FragmentTree {
             .find_map(|child| child.find(&info, 0, &mut process_func))
     }
 
-    pub fn remove_nodes_in_fragment_tree_from_set(&self, set: &mut FxHashSet<AnimationSetKey>) {
-        self.find(|fragment, _, _| {
-            let tag = fragment.tag()?;
-            set.remove(&AnimationSetKey::new(tag.node, tag.pseudo));
-            None::<()>
-        });
-    }
-
-    /// Get the vector of rectangles that surrounds the fragments of the node with the given address.
-    /// This function answers the `getClientRects()` query and the union of the rectangles answers
-    /// the `getBoundingClientRect()` query.
+    /// <https://drafts.csswg.org/cssom-view/#scrolling-area>
     ///
-    /// TODO: This function is supposed to handle scroll offsets, but that isn't happening at all.
-    pub fn get_content_boxes_for_node(&self, requested_node: OpaqueNode) -> Vec<Rect<Au>> {
-        let mut content_boxes = Vec::new();
-        let tag_to_find = Tag::new(requested_node);
-        self.find(|fragment, _, containing_block| {
-            if fragment.tag() != Some(tag_to_find) {
-                return None::<()>;
-            }
-
-            let fragment_relative_rect = match fragment {
-                Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                    fragment.borrow().border_rect()
-                },
-                Fragment::Positioning(fragment) => fragment.borrow().rect,
-                Fragment::Text(fragment) => fragment.borrow().rect,
-                Fragment::AbsoluteOrFixedPositioned(_) |
-                Fragment::Image(_) |
-                Fragment::IFrame(_) => return None,
-            };
-
-            let rect = fragment_relative_rect.translate(containing_block.origin.to_vector());
-
-            content_boxes.push(rect.to_untyped());
-            None::<()>
-        });
-        content_boxes
-    }
-
-    pub fn get_border_dimensions_for_node(&self, requested_node: OpaqueNode) -> Rect<i32> {
-        let tag_to_find = Tag::new(requested_node);
-        self.find(|fragment, _, _containing_block| {
-            if fragment.tag() != Some(tag_to_find) {
-                return None;
-            }
-
-            let rect = match fragment {
-                Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                    // https://drafts.csswg.org/cssom-view/#dom-element-clienttop
-                    // " If the element has no associated CSS layout box or if the
-                    //   CSS layout box is inline, return zero." For this check we
-                    // also explicitly ignore the list item portion of the display
-                    // style.
-                    let fragment = fragment.borrow();
-                    if fragment.is_inline_box() {
-                        return Some(Rect::zero());
-                    }
-                    if fragment.is_table_wrapper() {
-                        // For tables the border actually belongs to the table grid box,
-                        // so we need to include it in the dimension of the table wrapper box.
-                        let mut rect = fragment.border_rect();
-                        rect.origin = PhysicalPoint::zero();
-                        rect
-                    } else {
-                        let mut rect = fragment.padding_rect();
-                        rect.origin = PhysicalPoint::new(fragment.border.left, fragment.border.top);
-                        rect
-                    }
-                },
-                Fragment::Positioning(fragment) => fragment.borrow().rect.cast_unit(),
-                Fragment::Text(text_fragment) => text_fragment.borrow().rect,
-                _ => return None,
-            };
-
-            let rect = Rect::new(
-                Point2D::new(rect.origin.x.to_f32_px(), rect.origin.y.to_f32_px()),
-                Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px()),
-            );
-            Some(rect.round().to_i32().to_untyped())
-        })
-        .unwrap_or_else(Rect::zero)
-    }
-
+    /// Scrolling area for a viewport that is clipped according to overflow direction of root element.
     pub fn get_scrolling_area_for_viewport(&self) -> PhysicalRect<Au> {
         let mut scroll_area = self.initial_containing_block;
-        for fragment in self.root_fragments.iter() {
-            scroll_area = fragment
-                .scrolling_area(&self.initial_containing_block)
-                .union(&scroll_area);
+        if let Some(root_fragment) = self.root_fragments.first() {
+            for fragment in self.root_fragments.iter() {
+                scroll_area = fragment.unclipped_scrolling_area().union(&scroll_area);
+            }
+            match root_fragment {
+                Fragment::Box(fragment) | Fragment::Float(fragment) => fragment
+                    .borrow()
+                    .clip_unreachable_scrollable_overflow_region(
+                        scroll_area,
+                        self.initial_containing_block,
+                    ),
+                _ => scroll_area,
+            }
+        } else {
+            scroll_area
         }
-        scroll_area
     }
 
-    pub fn get_scrolling_area_for_node(&self, requested_node: OpaqueNode) -> PhysicalRect<Au> {
-        let tag_to_find = Tag::new(requested_node);
-        let scroll_area = self.find(|fragment, _, containing_block| {
-            if fragment.tag() == Some(tag_to_find) {
-                Some(fragment.scrolling_area(containing_block))
-            } else {
-                None
-            }
-        });
-        scroll_area.unwrap_or_else(PhysicalRect::<Au>::zero)
+    /// Find the `<body>` element's [`Fragment`], if it exists in this [`FragmentTree`].
+    pub(crate) fn body_fragment(&self) -> Option<ArcRefCell<BoxFragment>> {
+        fn find_body(children: &[Fragment]) -> Option<ArcRefCell<BoxFragment>> {
+            children.iter().find_map(|fragment| {
+                match fragment {
+                    Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                        let borrowed_box_fragment = box_fragment.borrow();
+                        if borrowed_box_fragment.is_body_element_of_html_element_root() {
+                            return Some(box_fragment.clone());
+                        }
+
+                        // The fragment for the `<body>` element is typically a child of the root (though,
+                        // not if it's absolutely positioned), so we need to recurse into the children of
+                        // the root to find it.
+                        //
+                        // Additionally, recurse into any anonymous fragments, as the `<body>` fragment may
+                        // have created anonymous parents (for instance by creating an inline formatting context).
+                        if borrowed_box_fragment.is_root_element() ||
+                            borrowed_box_fragment.base.is_anonymous()
+                        {
+                            find_body(&borrowed_box_fragment.children)
+                        } else {
+                            None
+                        }
+                    },
+                    Fragment::Positioning(positioning_context)
+                        if positioning_context.borrow().base.is_anonymous() =>
+                    {
+                        // If the `<body>` element is a `display: inline` then it might be nested inside of a
+                        // `PositioningFragment` for the purposes of putting it on the first line of the implied
+                        // inline formatting context.
+                        find_body(&positioning_context.borrow().children)
+                    },
+                    _ => None,
+                }
+            })
+        }
+
+        find_body(&self.root_fragments)
     }
 }

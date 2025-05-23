@@ -32,6 +32,8 @@ pub struct StructuredSerializedData {
     pub exceptions: Option<HashMap<DomExceptionId, DomException>>,
     /// Transferred objects.
     pub ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
+    /// Transform streams transferred objects.
+    pub transform_streams: Option<HashMap<MessagePortId, TransformStreamData>>,
 }
 
 impl StructuredSerializedData {
@@ -43,6 +45,7 @@ impl StructuredSerializedData {
             Transferrable::MessagePort => is_field_empty(&self.ports),
             Transferrable::ReadableStream => is_field_empty(&self.ports),
             Transferrable::WritableStream => is_field_empty(&self.ports),
+            Transferrable::TransformStream => is_field_empty(&self.ports),
         }
     }
 

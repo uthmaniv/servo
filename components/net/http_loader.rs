@@ -37,7 +37,7 @@ use hyper::ext::ReasonPhrase;
 use hyper::header::{HeaderName, TRANSFER_ENCODING};
 use hyper_serde::Serde;
 use hyper_util::client::legacy::Client;
-use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::ipc::{self, IpcSender, IpcSharedMemory};
 use ipc_channel::router::ROUTER;
 use log::{debug, error, info, log_enabled, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -462,7 +462,7 @@ fn auth_from_cache(
 /// used to fill the body with bytes coming-in over IPC.
 enum BodyChunk {
     /// A chunk of bytes.
-    Chunk(Vec<u8>),
+    Chunk(IpcSharedMemory),
     /// Body is done.
     Done,
 }
@@ -489,12 +489,14 @@ enum BodySink {
 }
 
 impl BodySink {
-    fn transmit_bytes(&self, bytes: Vec<u8>) {
+    fn transmit_bytes(&self, bytes: IpcSharedMemory) {
         match self {
             BodySink::Chunked(sender) => {
                 let sender = sender.clone();
-                HANDLE.lock().unwrap().as_mut().unwrap().spawn(async move {
-                    let _ = sender.send(Ok(Frame::data(bytes.into()))).await;
+                HANDLE.spawn(async move {
+                    let _ = sender
+                        .send(Ok(Frame::data(Bytes::copy_from_slice(&bytes))))
+                        .await;
                 });
             },
             BodySink::Buffered(sender) => {
@@ -577,7 +579,7 @@ async fn obtain_response(
                 body_port,
                 Box::new(move |message| {
                     info!("Received message");
-                    let bytes: Vec<u8> = match message.unwrap() {
+                    let bytes = match message.unwrap() {
                         BodyChunkResponse::Chunk(bytes) => bytes,
                         BodyChunkResponse::Done => {
                             // Step 3, abort these parallel steps.
@@ -622,8 +624,8 @@ async fn obtain_response(
                     let mut body = vec![];
                     loop {
                         match receiver.recv().await {
-                            Some(BodyChunk::Chunk(mut bytes)) => {
-                                body.append(&mut bytes);
+                            Some(BodyChunk::Chunk(bytes)) => {
+                                body.extend_from_slice(&bytes);
                             },
                             Some(BodyChunk::Done) => break,
                             None => warn!("Failed to read all chunks from request body."),
@@ -2002,7 +2004,7 @@ async fn http_network_fetch(
     let url1 = request.url();
     let url2 = url1.clone();
 
-    HANDLE.lock().unwrap().as_ref().unwrap().spawn(
+    HANDLE.spawn(
         res.into_body()
             .map_err(|e| {
                 warn!("Error streaming response body: {:?}", e);

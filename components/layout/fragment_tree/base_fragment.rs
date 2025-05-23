@@ -32,10 +32,8 @@ impl BaseFragment {
         }
     }
 
-    /// Returns true if this fragment is non-anonymous and it is for the given
-    /// OpaqueNode, regardless of the pseudo element.
-    pub(crate) fn is_for_node(&self, node: OpaqueNode) -> bool {
-        self.tag.map(|tag| tag.node == node).unwrap_or(false)
+    pub(crate) fn is_anonymous(&self) -> bool {
+        self.tag.is_none()
     }
 }
 
@@ -130,11 +128,6 @@ impl Tag {
     /// matching existing tags, since it does not accept an `info` argument.
     pub(crate) fn new_pseudo(node: OpaqueNode, pseudo: Option<PseudoElement>) -> Self {
         Tag { node, pseudo }
-    }
-
-    /// Returns true if this tag is for a pseudo element.
-    pub(crate) fn is_pseudo(&self) -> bool {
-        self.pseudo.is_some()
     }
 
     pub(crate) fn to_display_list_fragment_id(self) -> u64 {

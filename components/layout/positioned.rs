@@ -16,7 +16,6 @@ use style::values::specified::align::AlignFlags;
 
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
-use crate::dom::NodeExt;
 use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::formatting_contexts::{
     IndependentFormattingContext, IndependentFormattingContextContents,
@@ -25,11 +24,11 @@ use crate::fragment_tree::{
     BoxFragment, Fragment, FragmentFlags, HoistedSharedFragment, SpecificLayoutInfo,
 };
 use crate::geom::{
-    AuOrAuto, LengthPercentageOrAuto, LogicalRect, LogicalSides, LogicalSides1D, LogicalVec2,
-    PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize, PhysicalVec, Size, Sizes, ToLogical,
-    ToLogicalWithContainingBlock,
+    AuOrAuto, LazySize, LengthPercentageOrAuto, LogicalRect, LogicalSides, LogicalSides1D,
+    LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize, PhysicalVec, Size,
+    Sizes, ToLogical, ToLogicalWithContainingBlock,
 };
-use crate::sizing::ContentSizes;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::style_ext::{Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, DisplayInside};
 use crate::{
     ConstraintSpace, ContainingBlock, ContainingBlockSize, DefiniteContainingBlock,
@@ -39,16 +38,6 @@ use crate::{
 #[derive(Debug, MallocSizeOf)]
 pub(crate) struct AbsolutelyPositionedBox {
     pub context: IndependentFormattingContext,
-}
-
-#[derive(Clone, MallocSizeOf)]
-pub(crate) struct PositioningContext {
-    for_nearest_positioned_ancestor: Option<Vec<HoistedAbsolutelyPositionedBox>>,
-
-    // For nearest `containing block for all descendants` as defined by the CSS transforms
-    // spec.
-    // https://www.w3.org/TR/css-transforms-1/#containing-block-for-all-descendants
-    for_nearest_containing_block_for_all_descendants: Vec<HoistedAbsolutelyPositionedBox>,
 }
 
 #[derive(Clone, MallocSizeOf)]
@@ -66,9 +55,9 @@ impl AbsolutelyPositionedBox {
         Self { context }
     }
 
-    pub fn construct<'dom>(
+    pub fn construct(
         context: &LayoutContext,
-        node_info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        node_info: &NodeAndStyleInfo,
         display_inside: DisplayInside,
         contents: Contents,
     ) -> Self {
@@ -103,45 +92,26 @@ impl AbsolutelyPositionedBox {
     }
 }
 
+#[derive(Clone, Default, MallocSizeOf)]
+pub(crate) struct PositioningContext {
+    absolutes: Vec<HoistedAbsolutelyPositionedBox>,
+}
+
 impl PositioningContext {
-    pub(crate) fn new_for_containing_block_for_all_descendants() -> Self {
-        Self {
-            for_nearest_positioned_ancestor: None,
-            for_nearest_containing_block_for_all_descendants: Vec::new(),
-        }
+    #[inline]
+    pub(crate) fn new_for_layout_box_base(layout_box_base: &LayoutBoxBase) -> Option<Self> {
+        Self::new_for_style_and_fragment_flags(
+            &layout_box_base.style,
+            &layout_box_base.base_fragment_info.flags,
+        )
     }
 
-    /// Create a [PositioningContext] to use for laying out a subtree. The idea is that
-    /// when subtree layout is finished, the newly hoisted boxes can be processed
-    /// (normally adjusting their static insets) and then appended to the parent
-    /// [PositioningContext].
-    pub(crate) fn new_for_subtree(collects_for_nearest_positioned_ancestor: bool) -> Self {
-        Self {
-            for_nearest_positioned_ancestor: if collects_for_nearest_positioned_ancestor {
-                Some(Vec::new())
-            } else {
-                None
-            },
-            for_nearest_containing_block_for_all_descendants: Vec::new(),
-        }
-    }
-
-    pub(crate) fn collects_for_nearest_positioned_ancestor(&self) -> bool {
-        self.for_nearest_positioned_ancestor.is_some()
-    }
-
-    pub(crate) fn new_for_style(style: &ComputedValues) -> Option<Self> {
-        // NB: We never make PositioningContexts for replaced elements, which is why we always
-        // pass false here.
-        if style.establishes_containing_block_for_all_descendants(FragmentFlags::empty()) {
-            Some(Self::new_for_containing_block_for_all_descendants())
-        } else if style
-            .establishes_containing_block_for_absolute_descendants(FragmentFlags::empty())
-        {
-            Some(Self {
-                for_nearest_positioned_ancestor: Some(Vec::new()),
-                for_nearest_containing_block_for_all_descendants: Vec::new(),
-            })
+    fn new_for_style_and_fragment_flags(
+        style: &ComputedValues,
+        flags: &FragmentFlags,
+    ) -> Option<Self> {
+        if style.establishes_containing_block_for_absolute_descendants(*flags) {
+            Some(Self::default())
         } else {
             None
         }
@@ -184,20 +154,9 @@ impl PositioningContext {
         offset: &PhysicalVec<Au>,
         index: PositioningContextLength,
     ) {
-        if let Some(hoisted_boxes) = self.for_nearest_positioned_ancestor.as_mut() {
-            hoisted_boxes
-                .iter_mut()
-                .skip(index.for_nearest_positioned_ancestor)
-                .for_each(|hoisted_fragment| {
-                    hoisted_fragment
-                        .fragment
-                        .borrow_mut()
-                        .adjust_offsets(offset)
-                })
-        }
-        self.for_nearest_containing_block_for_all_descendants
+        self.absolutes
             .iter_mut()
-            .skip(index.for_nearest_containing_block_for_all_descendants)
+            .skip(index.0)
             .for_each(|hoisted_fragment| {
                 hoisted_fragment
                     .fragment
@@ -213,38 +172,89 @@ impl PositioningContext {
         &mut self,
         layout_context: &LayoutContext,
         containing_block: &ContainingBlock,
-        style: &ComputedValues,
+        base: &LayoutBoxBase,
         fragment_layout_fn: impl FnOnce(&mut Self) -> BoxFragment,
     ) -> BoxFragment {
-        // Try to create a context, but if one isn't necessary, simply create the fragment
-        // using the given closure and the current `PositioningContext`.
-        let mut new_context = match Self::new_for_style(style) {
-            Some(new_context) => new_context,
-            None => return fragment_layout_fn(self),
-        };
+        // If a new `PositioningContext` isn't necessary, simply create the fragment using
+        // the given closure and the current `PositioningContext`.
+        let establishes_containing_block_for_absolutes = base
+            .style
+            .establishes_containing_block_for_absolute_descendants(base.base_fragment_info.flags);
+        if !establishes_containing_block_for_absolutes {
+            return fragment_layout_fn(self);
+        }
 
+        let mut new_context = PositioningContext::default();
         let mut new_fragment = fragment_layout_fn(&mut new_context);
-        new_context.layout_collected_children(layout_context, &mut new_fragment);
 
-        // If the new context has any hoisted boxes for the nearest containing block for
-        // pass them up the tree.
+        // Lay out all of the absolutely positioned children for this fragment, and, if it
+        // isn't a containing block for fixed elements, then pass those up to the parent.
+        new_context.layout_collected_children(layout_context, &mut new_fragment);
         self.append(new_context);
 
-        if style.clone_position() == Position::Relative {
-            new_fragment.content_rect.origin += relative_adjustement(style, containing_block)
+        if base.style.clone_position() == Position::Relative {
+            new_fragment.content_rect.origin += relative_adjustement(&base.style, containing_block)
                 .to_physical_vector(containing_block.style.writing_mode)
         }
 
         new_fragment
     }
 
+    fn take_boxes_for_fragment(
+        &mut self,
+        new_fragment: &BoxFragment,
+        boxes_to_layout_out: &mut Vec<HoistedAbsolutelyPositionedBox>,
+        boxes_to_continue_hoisting_out: &mut Vec<HoistedAbsolutelyPositionedBox>,
+    ) {
+        debug_assert!(
+            new_fragment
+                .style
+                .establishes_containing_block_for_absolute_descendants(new_fragment.base.flags)
+        );
+
+        if new_fragment
+            .style
+            .establishes_containing_block_for_all_descendants(new_fragment.base.flags)
+        {
+            boxes_to_layout_out.append(&mut self.absolutes);
+            return;
+        }
+
+        // TODO: This could potentially use `extract_if` when that is stabilized.
+        let (mut boxes_to_layout, mut boxes_to_continue_hoisting) = self
+            .absolutes
+            .drain(..)
+            .partition(|hoisted_box| hoisted_box.position() != Position::Fixed);
+        boxes_to_layout_out.append(&mut boxes_to_layout);
+        boxes_to_continue_hoisting_out.append(&mut boxes_to_continue_hoisting);
+    }
+
     // Lay out the hoisted boxes collected into this `PositioningContext` and add them
     // to the given `BoxFragment`.
-    pub fn layout_collected_children(
+    pub(crate) fn layout_collected_children(
         &mut self,
         layout_context: &LayoutContext,
         new_fragment: &mut BoxFragment,
     ) {
+        if self.absolutes.is_empty() {
+            return;
+        }
+
+        // Sometimes we create temporary PositioningContexts just to collect hoisted absolutes and
+        // then these are processed later. In that case and if this fragment doesn't establish a
+        // containing block for absolutes at all, we just do nothing. All hoisted fragments will
+        // later be passed up to a parent PositioningContext.
+        //
+        // Handling this case here, when the PositioningContext is completely ineffectual other than
+        // as a temporary container for hoisted boxes, means that callers can execute less conditional
+        // code.
+        if !new_fragment
+            .style
+            .establishes_containing_block_for_absolute_descendants(new_fragment.base.flags)
+        {
+            return;
+        }
+
         let padding_rect = PhysicalRect::new(
             // Ignore the content rect’s position in its own containing block:
             PhysicalPoint::origin(),
@@ -258,83 +268,58 @@ impl PositioningContext {
             style: &new_fragment.style,
         };
 
-        let take_hoisted_boxes_pending_layout =
-            |context: &mut Self| match context.for_nearest_positioned_ancestor.as_mut() {
-                Some(fragments) => mem::take(fragments),
-                None => mem::take(&mut context.for_nearest_containing_block_for_all_descendants),
-            };
+        let mut fixed_position_boxes_to_hoist = Vec::new();
+        let mut boxes_to_layout = Vec::new();
+        self.take_boxes_for_fragment(
+            new_fragment,
+            &mut boxes_to_layout,
+            &mut fixed_position_boxes_to_hoist,
+        );
 
-        // Loop because it’s possible that we discover (the static position of)
-        // more absolutely-positioned boxes while doing layout for others.
-        let mut hoisted_boxes = take_hoisted_boxes_pending_layout(self);
-        let mut laid_out_child_fragments = Vec::new();
-        while !hoisted_boxes.is_empty() {
+        // Laying out a `position: absolute` child (which only establishes a containing block for
+        // `position: absolute` descendants) can result in more `position: fixed` descendants
+        // collecting in `self.absolutes`. We need to loop here in order to keep either laying them
+        // out or putting them into `fixed_position_boxes_to_hoist`. We know there aren't any more
+        // when `self.absolutes` is empty.
+        while !boxes_to_layout.is_empty() {
             HoistedAbsolutelyPositionedBox::layout_many(
                 layout_context,
-                &mut hoisted_boxes,
-                &mut laid_out_child_fragments,
-                &mut self.for_nearest_containing_block_for_all_descendants,
+                std::mem::take(&mut boxes_to_layout),
+                &mut new_fragment.children,
+                &mut self.absolutes,
                 &containing_block,
                 new_fragment.padding,
             );
-            hoisted_boxes = take_hoisted_boxes_pending_layout(self);
+
+            self.take_boxes_for_fragment(
+                new_fragment,
+                &mut boxes_to_layout,
+                &mut fixed_position_boxes_to_hoist,
+            );
         }
 
-        new_fragment.children.extend(laid_out_child_fragments);
+        // We replace here instead of simply preserving these in `take_boxes_for_fragment`
+        // so that we don't have to continually re-iterate over them when laying out in the
+        // loop above.
+        self.absolutes = fixed_position_boxes_to_hoist;
     }
 
-    pub(crate) fn push(&mut self, box_: HoistedAbsolutelyPositionedBox) {
-        if let Some(nearest) = &mut self.for_nearest_positioned_ancestor {
-            let position = box_
-                .absolutely_positioned_box
-                .borrow()
-                .context
-                .style()
-                .clone_position();
-            match position {
-                Position::Fixed => {}, // fall through
-                Position::Absolute => return nearest.push(box_),
-                Position::Static | Position::Relative | Position::Sticky => unreachable!(),
-            }
-        }
-        self.for_nearest_containing_block_for_all_descendants
-            .push(box_)
+    pub(crate) fn push(&mut self, hoisted_box: HoistedAbsolutelyPositionedBox) {
+        debug_assert!(matches!(
+            hoisted_box.position(),
+            Position::Absolute | Position::Fixed
+        ));
+        self.absolutes.push(hoisted_box);
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.for_nearest_containing_block_for_all_descendants
-            .is_empty() &&
-            self.for_nearest_positioned_ancestor
-                .as_ref()
-                .is_none_or(|vector| vector.is_empty())
-    }
-
-    pub(crate) fn append(&mut self, other: Self) {
-        if other.is_empty() {
+    pub(crate) fn append(&mut self, mut other: Self) {
+        if other.absolutes.is_empty() {
             return;
         }
-
-        vec_append_owned(
-            &mut self.for_nearest_containing_block_for_all_descendants,
-            other.for_nearest_containing_block_for_all_descendants,
-        );
-
-        match (
-            self.for_nearest_positioned_ancestor.as_mut(),
-            other.for_nearest_positioned_ancestor,
-        ) {
-            (Some(us), Some(them)) => vec_append_owned(us, them),
-            (None, Some(them)) => {
-                // This is the case where we have laid out the absolute children in a containing
-                // block for absolutes and we then are passing up the fixed-position descendants
-                // to the containing block for all descendants.
-                vec_append_owned(
-                    &mut self.for_nearest_containing_block_for_all_descendants,
-                    them,
-                );
-            },
-            (None, None) => {},
-            _ => unreachable!(),
+        if self.absolutes.is_empty() {
+            self.absolutes = other.absolutes;
+        } else {
+            self.absolutes.append(&mut other.absolutes)
         }
     }
 
@@ -344,19 +329,16 @@ impl PositioningContext {
         initial_containing_block: &DefiniteContainingBlock,
         fragments: &mut Vec<Fragment>,
     ) {
-        debug_assert!(self.for_nearest_positioned_ancestor.is_none());
-
-        // Loop because it’s possible that we discover (the static position of)
-        // more absolutely-positioned boxes while doing layout for others.
-        while !self
-            .for_nearest_containing_block_for_all_descendants
-            .is_empty()
-        {
+        // Laying out a `position: absolute` child (which only establishes a containing block for
+        // `position: absolute` descendants) can result in more `position: fixed` descendants
+        // collecting in `self.absolutes`. We need to loop here in order to keep laying them out. We
+        // know there aren't any more when `self.absolutes` is empty.
+        while !self.absolutes.is_empty() {
             HoistedAbsolutelyPositionedBox::layout_many(
                 layout_context,
-                &mut mem::take(&mut self.for_nearest_containing_block_for_all_descendants),
+                mem::take(&mut self.absolutes),
                 fragments,
-                &mut self.for_nearest_containing_block_for_all_descendants,
+                &mut self.absolutes,
                 initial_containing_block,
                 Default::default(),
             )
@@ -365,58 +347,46 @@ impl PositioningContext {
 
     /// Get the length of this [PositioningContext].
     pub(crate) fn len(&self) -> PositioningContextLength {
-        PositioningContextLength {
-            for_nearest_positioned_ancestor: self
-                .for_nearest_positioned_ancestor
-                .as_ref()
-                .map_or(0, |vec| vec.len()),
-            for_nearest_containing_block_for_all_descendants: self
-                .for_nearest_containing_block_for_all_descendants
-                .len(),
-        }
+        PositioningContextLength(self.absolutes.len())
     }
 
     /// Truncate this [PositioningContext] to the given [PositioningContextLength].  This
     /// is useful for "unhoisting" boxes in this context and returning it to the state at
     /// the time that [`PositioningContext::len()`] was called.
     pub(crate) fn truncate(&mut self, length: &PositioningContextLength) {
-        if let Some(vec) = self.for_nearest_positioned_ancestor.as_mut() {
-            vec.truncate(length.for_nearest_positioned_ancestor);
-        }
-        self.for_nearest_containing_block_for_all_descendants
-            .truncate(length.for_nearest_containing_block_for_all_descendants);
+        self.absolutes.truncate(length.0)
     }
 }
 
 /// A data structure which stores the size of a positioning context.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct PositioningContextLength {
-    /// The number of boxes that will be hoisted the the nearest positioned ancestor for
-    /// layout.
-    for_nearest_positioned_ancestor: usize,
-    /// The number of boxes that will be hoisted the the nearest ancestor which
-    /// establishes a containing block for all descendants for layout.
-    for_nearest_containing_block_for_all_descendants: usize,
-}
+pub(crate) struct PositioningContextLength(usize);
 
 impl Zero for PositioningContextLength {
     fn zero() -> Self {
-        PositioningContextLength {
-            for_nearest_positioned_ancestor: 0,
-            for_nearest_containing_block_for_all_descendants: 0,
-        }
+        Self(0)
     }
 
     fn is_zero(&self) -> bool {
-        self.for_nearest_positioned_ancestor == 0 &&
-            self.for_nearest_containing_block_for_all_descendants == 0
+        self.0.is_zero()
     }
 }
 
 impl HoistedAbsolutelyPositionedBox {
+    fn position(&self) -> Position {
+        let position = self
+            .absolutely_positioned_box
+            .borrow()
+            .context
+            .style()
+            .clone_position();
+        assert!(position == Position::Fixed || position == Position::Absolute);
+        position
+    }
+
     pub(crate) fn layout_many(
         layout_context: &LayoutContext,
-        boxes: &mut [Self],
+        mut boxes: Vec<Self>,
         fragments: &mut Vec<Fragment>,
         for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
         containing_block: &DefiniteContainingBlock,
@@ -463,7 +433,7 @@ impl HoistedAbsolutelyPositionedBox {
     pub(crate) fn layout(
         &mut self,
         layout_context: &LayoutContext,
-        for_nearest_containing_block_for_all_descendants: &mut Vec<HoistedAbsolutelyPositionedBox>,
+        hoisted_absolutes_from_children: &mut Vec<HoistedAbsolutelyPositionedBox>,
         containing_block: &DefiniteContainingBlock,
         containing_block_padding: PhysicalSides<Au>,
     ) -> Fragment {
@@ -502,7 +472,7 @@ impl HoistedAbsolutelyPositionedBox {
             false => shared_fragment.resolved_alignment.inline,
         };
 
-        let mut inline_axis_solver = AbsoluteAxisSolver {
+        let inline_axis_solver = AbsoluteAxisSolver {
             axis: Direction::Inline,
             containing_size: cbis,
             padding_border_sum: pbm.padding_border_sums.inline,
@@ -525,7 +495,7 @@ impl HoistedAbsolutelyPositionedBox {
             true => style.clone_align_self().0.0,
             false => shared_fragment.resolved_alignment.block,
         };
-        let mut block_axis_solver = AbsoluteAxisSolver {
+        let block_axis_solver = AbsoluteAxisSolver {
             axis: Direction::Block,
             containing_size: cbbs,
             padding_border_sum: pbm.padding_border_sums.block,
@@ -540,53 +510,7 @@ impl HoistedAbsolutelyPositionedBox {
             is_table,
         };
 
-        if let IndependentFormattingContextContents::Replaced(replaced) = &context.contents {
-            // https://drafts.csswg.org/css2/visudet.html#abs-replaced-width
-            // https://drafts.csswg.org/css2/visudet.html#abs-replaced-height
-            let inset_sums = LogicalVec2 {
-                inline: inline_axis_solver.inset_sum(),
-                block: block_axis_solver.inset_sum(),
-            };
-            let automatic_size = |alignment: AlignFlags, offsets: &LogicalSides1D<_>| {
-                if alignment.value() == AlignFlags::STRETCH && !offsets.either_auto() {
-                    Size::Stretch
-                } else {
-                    Size::FitContent
-                }
-            };
-            let used_size = replaced.used_size_as_if_inline_element_from_content_box_sizes(
-                containing_block,
-                &style,
-                context.preferred_aspect_ratio(&pbm.padding_border_sums),
-                LogicalVec2 {
-                    inline: &inline_axis_solver.computed_sizes,
-                    block: &block_axis_solver.computed_sizes,
-                },
-                LogicalVec2 {
-                    inline: automatic_size(inline_alignment, &inline_axis_solver.box_offsets),
-                    block: automatic_size(block_alignment, &block_axis_solver.box_offsets),
-                },
-                pbm.padding_border_sums + pbm.margin.auto_is(Au::zero).sum() + inset_sums,
-            );
-            inline_axis_solver.override_size(used_size.inline);
-            block_axis_solver.override_size(used_size.block);
-        }
-
-        // The block axis can depend on layout results, so we only solve it tentatively,
-        // we may have to resolve it properly later on.
-        let mut block_axis = block_axis_solver.solve_tentatively();
-
-        // The inline axis can be fully resolved, computing intrinsic sizes using the
-        // tentative block size.
-        let mut inline_axis = inline_axis_solver.solve(Some(|| {
-            let ratio = context.preferred_aspect_ratio(&pbm.padding_border_sums);
-            let constraint_space = ConstraintSpace::new(block_axis.size, style.writing_mode, ratio);
-            context
-                .inline_content_sizes(layout_context, &constraint_space)
-                .sizes
-        }));
-
-        let mut positioning_context = PositioningContext::new_for_style(&style).unwrap();
+        let mut positioning_context = PositioningContext::default();
         let mut new_fragment = {
             let content_size: LogicalVec2<Au>;
             let fragments;
@@ -595,10 +519,34 @@ impl HoistedAbsolutelyPositionedBox {
                 IndependentFormattingContextContents::Replaced(replaced) => {
                     // https://drafts.csswg.org/css2/visudet.html#abs-replaced-width
                     // https://drafts.csswg.org/css2/visudet.html#abs-replaced-height
-                    content_size = LogicalVec2 {
-                        inline: inline_axis.size.to_definite().unwrap(),
-                        block: block_axis.size.to_definite().unwrap(),
+                    let inset_sums = LogicalVec2 {
+                        inline: inline_axis_solver.inset_sum(),
+                        block: block_axis_solver.inset_sum(),
                     };
+                    let automatic_size = |alignment: AlignFlags, offsets: &LogicalSides1D<_>| {
+                        if alignment.value() == AlignFlags::STRETCH && !offsets.either_auto() {
+                            Size::Stretch
+                        } else {
+                            Size::FitContent
+                        }
+                    };
+                    content_size = replaced.used_size_as_if_inline_element_from_content_box_sizes(
+                        containing_block,
+                        &style,
+                        context.preferred_aspect_ratio(&pbm.padding_border_sums),
+                        LogicalVec2 {
+                            inline: &inline_axis_solver.computed_sizes,
+                            block: &block_axis_solver.computed_sizes,
+                        },
+                        LogicalVec2 {
+                            inline: automatic_size(
+                                inline_alignment,
+                                &inline_axis_solver.box_offsets,
+                            ),
+                            block: automatic_size(block_alignment, &block_axis_solver.box_offsets),
+                        },
+                        pbm.padding_border_sums + pbm.margin.auto_is(Au::zero).sum() + inset_sums,
+                    );
                     fragments = replaced.make_fragments(
                         layout_context,
                         &style,
@@ -608,11 +556,40 @@ impl HoistedAbsolutelyPositionedBox {
                 IndependentFormattingContextContents::NonReplaced(non_replaced) => {
                     // https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-width
                     // https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-height
-                    let inline_size = inline_axis.size.to_definite().unwrap();
+
+                    // The block size can depend on layout results, so we only solve it extrinsically,
+                    // we may have to resolve it properly later on.
+                    let block_automatic_size = block_axis_solver.automatic_size();
+                    let block_stretch_size = Some(block_axis_solver.stretch_size());
+                    let extrinsic_block_size = block_axis_solver.computed_sizes.resolve_extrinsic(
+                        block_automatic_size,
+                        Au::zero(),
+                        block_stretch_size,
+                    );
+
+                    // The inline axis can be fully resolved, computing intrinsic sizes using the
+                    // extrinsic block size.
+                    let get_inline_content_size = || {
+                        let ratio = context.preferred_aspect_ratio(&pbm.padding_border_sums);
+                        let constraint_space =
+                            ConstraintSpace::new(extrinsic_block_size, style.writing_mode, ratio);
+                        context
+                            .inline_content_sizes(layout_context, &constraint_space)
+                            .sizes
+                    };
+                    let inline_size = inline_axis_solver.computed_sizes.resolve(
+                        Direction::Inline,
+                        inline_axis_solver.automatic_size(),
+                        Au::zero,
+                        Some(inline_axis_solver.stretch_size()),
+                        get_inline_content_size,
+                        is_table,
+                    );
+
                     let containing_block_for_children = ContainingBlock {
                         size: ContainingBlockSize {
                             inline: inline_size,
-                            block: block_axis.size,
+                            block: extrinsic_block_size,
                         },
                         style: &style,
                     };
@@ -623,6 +600,14 @@ impl HoistedAbsolutelyPositionedBox {
                         "Mixed horizontal and vertical writing modes are not supported yet"
                     );
 
+                    let lazy_block_size = LazySize::new(
+                        &block_axis_solver.computed_sizes,
+                        Direction::Block,
+                        block_automatic_size,
+                        Au::zero,
+                        block_stretch_size,
+                        is_table,
+                    );
                     let independent_layout = non_replaced.layout(
                         layout_context,
                         &mut positioning_context,
@@ -630,24 +615,17 @@ impl HoistedAbsolutelyPositionedBox {
                         containing_block,
                         &context.base,
                         false, /* depends_on_block_constraints */
+                        &lazy_block_size,
                     );
 
-                    let inline_size = if let Some(inline_size) =
-                        independent_layout.content_inline_size_for_table
-                    {
-                        // Tables can become narrower than predicted due to collapsed columns,
-                        // so we need to solve again to update margins.
-                        inline_axis_solver.override_size(inline_size);
-                        inline_axis = inline_axis_solver.solve_tentatively();
-                        inline_size
-                    } else {
-                        inline_size
-                    };
+                    // Tables can become narrower than predicted due to collapsed columns
+                    let inline_size = independent_layout
+                        .content_inline_size_for_table
+                        .unwrap_or(inline_size);
 
                     // Now we can properly solve the block size.
-                    block_axis = block_axis_solver
-                        .solve(Some(|| independent_layout.content_block_size.into()));
-                    let block_size = block_axis.size.to_definite().unwrap();
+                    let block_size =
+                        lazy_block_size.resolve(|| independent_layout.content_block_size);
 
                     content_size = LogicalVec2 {
                         inline: inline_size,
@@ -658,11 +636,13 @@ impl HoistedAbsolutelyPositionedBox {
                 },
             };
 
+            let inline_margins = inline_axis_solver.solve_margins(content_size.inline);
+            let block_margins = block_axis_solver.solve_margins(content_size.block);
             let margin = LogicalSides {
-                inline_start: inline_axis.margin_start,
-                inline_end: inline_axis.margin_end,
-                block_start: block_axis.margin_start,
-                block_end: block_axis.margin_end,
+                inline_start: inline_margins.start,
+                inline_end: inline_margins.end,
+                block_start: block_margins.start,
+                block_end: block_margins.end,
             };
 
             let pb = pbm.padding + pbm.border;
@@ -699,6 +679,10 @@ impl HoistedAbsolutelyPositionedBox {
             )
             .with_specific_layout_info(specific_layout_info)
         };
+
+        // This is an absolutely positioned element, which means it also establishes a
+        // containing block for absolutes. We lay out any absolutely positioned children
+        // here and pass the rest to `hoisted_absolutes_from_children.`
         positioning_context.layout_collected_children(layout_context, &mut new_fragment);
 
         // Any hoisted boxes that remain in this positioning context are going to be hoisted
@@ -711,8 +695,7 @@ impl HoistedAbsolutelyPositionedBox {
             PositioningContextLength::zero(),
         );
 
-        for_nearest_containing_block_for_all_descendants
-            .extend(positioning_context.for_nearest_containing_block_for_all_descendants);
+        hoisted_absolutes_from_children.extend(positioning_context.absolutes);
 
         let fragment = Fragment::Box(ArcRefCell::new(new_fragment));
         context.base.set_fragment(fragment.clone());
@@ -739,12 +722,6 @@ impl LogicalRect<Au> {
             },
         }
     }
-}
-
-struct AxisResult {
-    size: SizeConstraint,
-    margin_start: Au,
-    margin_end: Au,
 }
 
 struct AbsoluteAxisSolver<'a> {
@@ -789,101 +766,56 @@ impl AbsoluteAxisSolver<'_> {
         }
     }
 
-    /// This unifies some of the parts in common in:
-    ///
-    /// * <https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-width>
-    /// * <https://drafts.csswg.org/css2/visudet.html#abs-non-replaced-height>
-    ///
-    /// … and:
-    ///
-    /// * <https://drafts.csswg.org/css2/visudet.html#abs-replaced-width>
-    /// * <https://drafts.csswg.org/css2/visudet.html#abs-replaced-height>
-    ///
-    /// In the replaced case, `size` is never `Auto`.
-    fn solve(&self, get_content_size: Option<impl FnOnce() -> ContentSizes>) -> AxisResult {
-        let solve_size = |initial_behavior, stretch_size: Au| -> SizeConstraint {
-            let stretch_size = stretch_size.max(Au::zero());
-            if let Some(get_content_size) = get_content_size {
-                SizeConstraint::Definite(self.computed_sizes.resolve(
-                    self.axis,
-                    initial_behavior,
-                    Au::zero,
-                    Some(stretch_size),
-                    get_content_size,
-                    self.is_table,
-                ))
-            } else {
-                self.computed_sizes.resolve_extrinsic(
-                    initial_behavior,
-                    Au::zero(),
-                    Some(stretch_size),
-                )
-            }
-        };
-        if self.box_offsets.either_auto() {
-            let margin_start = self.computed_margin_start.auto_is(Au::zero);
-            let margin_end = self.computed_margin_end.auto_is(Au::zero);
-            let stretch_size = self.containing_size -
-                self.inset_sum() -
-                self.padding_border_sum -
-                margin_start -
-                margin_end;
-            let size = solve_size(Size::FitContent, stretch_size);
-            AxisResult {
-                size,
-                margin_start,
-                margin_end,
-            }
-        } else {
-            let mut free_space = self.containing_size - self.inset_sum() - self.padding_border_sum;
-            let stretch_size = free_space -
-                self.computed_margin_start.auto_is(Au::zero) -
-                self.computed_margin_end.auto_is(Au::zero);
-            let initial_behavior = match self.alignment.value() {
-                AlignFlags::NORMAL | AlignFlags::AUTO if !self.is_table => Size::Stretch,
-                AlignFlags::STRETCH => Size::Stretch,
-                _ => Size::FitContent,
-            };
-            let size = solve_size(initial_behavior, stretch_size);
-            if let Some(used_size) = size.to_definite() {
-                free_space -= used_size;
-            } else {
-                free_space = Au::zero();
-            }
-            let (margin_start, margin_end) =
-                match (self.computed_margin_start, self.computed_margin_end) {
-                    (AuOrAuto::Auto, AuOrAuto::Auto) => {
-                        if self.avoid_negative_margin_start && free_space < Au::zero() {
-                            (Au::zero(), free_space)
-                        } else {
-                            let margin_start = free_space / 2;
-                            (margin_start, free_space - margin_start)
-                        }
-                    },
-                    (AuOrAuto::Auto, AuOrAuto::LengthPercentage(end)) => (free_space - end, end),
-                    (AuOrAuto::LengthPercentage(start), AuOrAuto::Auto) => {
-                        (start, free_space - start)
-                    },
-                    (AuOrAuto::LengthPercentage(start), AuOrAuto::LengthPercentage(end)) => {
-                        (start, end)
-                    },
-                };
-            AxisResult {
-                size,
-                margin_start,
-                margin_end,
-            }
+    #[inline]
+    fn automatic_size(&self) -> Size<Au> {
+        match self.alignment.value() {
+            _ if self.box_offsets.either_auto() => Size::FitContent,
+            AlignFlags::NORMAL | AlignFlags::AUTO if !self.is_table => Size::Stretch,
+            AlignFlags::STRETCH => Size::Stretch,
+            _ => Size::FitContent,
         }
     }
 
-    fn solve_tentatively(&mut self) -> AxisResult {
-        self.solve(None::<fn() -> ContentSizes>)
+    #[inline]
+    fn stretch_size(&self) -> Au {
+        Au::zero().max(
+            self.containing_size -
+                self.inset_sum() -
+                self.padding_border_sum -
+                self.computed_margin_start.auto_is(Au::zero) -
+                self.computed_margin_end.auto_is(Au::zero),
+        )
     }
 
-    fn override_size(&mut self, size: Au) {
-        self.computed_sizes.preferred = Size::Numeric(size);
-        self.computed_sizes.min = Size::default();
-        self.computed_sizes.max = Size::default();
+    fn solve_margins(&self, size: Au) -> LogicalSides1D<Au> {
+        if self.box_offsets.either_auto() {
+            LogicalSides1D::new(
+                self.computed_margin_start.auto_is(Au::zero),
+                self.computed_margin_end.auto_is(Au::zero),
+            )
+        } else {
+            let free_space =
+                self.containing_size - self.inset_sum() - self.padding_border_sum - size;
+            match (self.computed_margin_start, self.computed_margin_end) {
+                (AuOrAuto::Auto, AuOrAuto::Auto) => {
+                    if self.avoid_negative_margin_start && free_space < Au::zero() {
+                        LogicalSides1D::new(Au::zero(), free_space)
+                    } else {
+                        let margin_start = free_space / 2;
+                        LogicalSides1D::new(margin_start, free_space - margin_start)
+                    }
+                },
+                (AuOrAuto::Auto, AuOrAuto::LengthPercentage(end)) => {
+                    LogicalSides1D::new(free_space - end, end)
+                },
+                (AuOrAuto::LengthPercentage(start), AuOrAuto::Auto) => {
+                    LogicalSides1D::new(start, free_space - start)
+                },
+                (AuOrAuto::LengthPercentage(start), AuOrAuto::LengthPercentage(end)) => {
+                    LogicalSides1D::new(start, end)
+                },
+            }
+        }
     }
 
     fn origin_for_margin_box(
@@ -1011,14 +943,6 @@ impl AbsoluteAxisSolver<'_> {
         let min = Au::zero().min(offsets.start);
         let max = self.containing_size - Au::zero().min(offsets.end) - size;
         origin.clamp_between_extremums(min, Some(max))
-    }
-}
-
-fn vec_append_owned<T>(a: &mut Vec<T>, mut b: Vec<T>) {
-    if a.is_empty() {
-        *a = b
-    } else {
-        a.append(&mut b)
     }
 }
 

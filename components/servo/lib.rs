@@ -18,6 +18,7 @@
 //! `WindowMethods` trait.
 
 mod clipboard_delegate;
+mod javascript_evaluator;
 mod proxies;
 mod responders;
 mod servo_delegate;
@@ -38,7 +39,6 @@ use base::id::{PipelineNamespace, PipelineNamespaceId};
 use bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
-use canvas::WebGLComm;
 use canvas::canvas_paint_thread::CanvasPaintThread;
 use canvas_traits::webgl::{GlType, WebGLThreads};
 use clipboard_delegate::StringRequest;
@@ -66,6 +66,7 @@ use constellation::{
 };
 use constellation_traits::{EmbedderToConstellationMessage, ScriptToConstellationChan};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use embedder_traits::FormControl as EmbedderFormControl;
 use embedder_traits::user_content_manager::UserContentManager;
 pub use embedder_traits::*;
 use env_logger::Builder as EnvLoggerBuilder;
@@ -83,6 +84,7 @@ pub use gleam::gl;
 use gleam::gl::RENDERER;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
+use javascript_evaluator::JavaScriptEvaluator;
 pub use keyboard_types::*;
 use layout::LayoutFactoryImpl;
 use log::{Log, Metadata, Record, debug, warn};
@@ -99,6 +101,7 @@ use servo_delegate::DefaultServoDelegate;
 use servo_media::ServoMedia;
 use servo_media::player::context::GlContext;
 use servo_url::ServoUrl;
+use webgl::WebGLComm;
 #[cfg(feature = "webgpu")]
 pub use webgpu;
 #[cfg(feature = "webgpu")]
@@ -120,10 +123,11 @@ pub use {bluetooth, bluetooth_traits};
 use crate::proxies::ConstellationProxy;
 use crate::responders::ServoErrorChannel;
 pub use crate::servo_delegate::{ServoDelegate, ServoError};
+use crate::webrender_api::FrameReadyParams;
 pub use crate::webview::{WebView, WebViewBuilder};
 pub use crate::webview_delegate::{
-    AllowOrDenyRequest, AuthenticationRequest, FormControl, NavigationRequest, PermissionRequest,
-    SelectElement, WebResourceLoad, WebViewDelegate,
+    AllowOrDenyRequest, AuthenticationRequest, ColorPicker, FormControl, NavigationRequest,
+    PermissionRequest, SelectElement, WebResourceLoad, WebViewDelegate,
 };
 
 #[cfg(feature = "webdriver")]
@@ -195,6 +199,9 @@ pub struct Servo {
     compositor: Rc<RefCell<IOCompositor>>,
     constellation_proxy: ConstellationProxy,
     embedder_receiver: Receiver<EmbedderMsg>,
+    /// A struct that tracks ongoing JavaScript evaluations and is responsible for
+    /// calling the callback when the evaluation is complete.
+    javascript_evaluator: Rc<RefCell<JavaScriptEvaluator>>,
     /// Tracks whether we are in the process of shutting down, or have shut down.
     /// This is shared with `WebView`s and the `ServoRenderer`.
     shutdown_state: Rc<Cell<ShutdownState>>,
@@ -233,23 +240,19 @@ impl webrender_api::RenderNotifier for RenderNotifier {
     fn new_frame_ready(
         &self,
         document_id: DocumentId,
-        _scrolled: bool,
-        composite_needed: bool,
-        _frame_publish_id: FramePublishId,
+        _: FramePublishId,
+        frame_ready_params: &FrameReadyParams,
     ) {
         self.compositor_proxy
             .send(CompositorMsg::NewWebRenderFrameReady(
                 document_id,
-                composite_needed,
+                frame_ready_params.render,
             ));
     }
 }
 
 impl Servo {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip(builder), fields(servo_profiling = true), level = "trace",)
-    )]
+    #[servo_tracing::instrument(skip(builder))]
     fn new(builder: ServoBuilder) -> Self {
         // Global configuration options, parsed from the command line.
         let opts = builder.opts.map(|opts| *opts);
@@ -490,10 +493,14 @@ impl Servo {
             opts.debug.convert_mouse_to_touch,
         );
 
+        let constellation_proxy = ConstellationProxy::new(constellation_chan);
         Self {
             delegate: RefCell::new(Rc::new(DefaultServoDelegate)),
             compositor: Rc::new(RefCell::new(compositor)),
-            constellation_proxy: ConstellationProxy::new(constellation_chan),
+            javascript_evaluator: Rc::new(RefCell::new(JavaScriptEvaluator::new(
+                constellation_proxy.clone(),
+            ))),
+            constellation_proxy,
             embedder_receiver,
             shutdown_state,
             webviews: Default::default(),
@@ -741,6 +748,11 @@ impl Servo {
                     webview.delegate().request_unload(webview, request);
                 }
             },
+            EmbedderMsg::FinishJavaScriptEvaluation(evaluation_id, result) => {
+                self.javascript_evaluator
+                    .borrow_mut()
+                    .finish_evaluation(evaluation_id, result);
+            },
             EmbedderMsg::Keyboard(webview_id, keyboard_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
@@ -954,18 +966,30 @@ impl Servo {
                     None => self.delegate().show_notification(notification),
                 }
             },
-            EmbedderMsg::ShowSelectElementMenu(
-                webview_id,
-                options,
-                selected_option,
-                position,
-                ipc_sender,
-            ) => {
+            EmbedderMsg::ShowFormControl(webview_id, position, form_control) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
-                    let prompt = SelectElement::new(options, selected_option, position, ipc_sender);
-                    webview
-                        .delegate()
-                        .show_form_control(webview, FormControl::SelectElement(prompt));
+                    let form_control = match form_control {
+                        EmbedderFormControl::SelectElement(
+                            options,
+                            selected_option,
+                            ipc_sender,
+                        ) => FormControl::SelectElement(SelectElement::new(
+                            options,
+                            selected_option,
+                            position,
+                            ipc_sender,
+                        )),
+                        EmbedderFormControl::ColorPicker(current_color, ipc_sender) => {
+                            FormControl::ColorPicker(ColorPicker::new(
+                                current_color,
+                                position,
+                                ipc_sender,
+                                self.servo_errors.sender(),
+                            ))
+                        },
+                    };
+
+                    webview.delegate().show_form_control(webview, form_control);
                 }
             },
         }
@@ -1047,7 +1071,11 @@ fn create_constellation(
     );
 
     let system_font_service = Arc::new(
-        SystemFontService::spawn(compositor_proxy.cross_process_compositor_api.clone()).to_proxy(),
+        SystemFontService::spawn(
+            compositor_proxy.cross_process_compositor_api.clone(),
+            mem_profiler_chan.clone(),
+        )
+        .to_proxy(),
     );
 
     let (canvas_create_sender, canvas_ipc_sender) = CanvasPaintThread::start(

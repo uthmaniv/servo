@@ -15,6 +15,12 @@ use strum::EnumIter;
 
 use crate::PortMessageTask;
 
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct TransformStreamData {
+    pub readable: (MessagePortId, MessagePortImpl),
+    pub writable: (MessagePortId, MessagePortImpl),
+}
+
 /// All the DOM interfaces that can be transferred.
 #[derive(Clone, Copy, Debug, EnumIter)]
 pub enum Transferrable {
@@ -24,6 +30,8 @@ pub enum Transferrable {
     ReadableStream,
     /// The `WritableStream` interface.
     WritableStream,
+    /// The `TransformStream` interface.
+    TransformStream,
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -77,7 +85,12 @@ impl MessagePortImpl {
         self.entangled_port
     }
 
-    /// Entanged this port with another.
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    pub fn disentangle(&mut self) -> Option<MessagePortId> {
+        self.entangled_port.take()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#entangle>
     pub fn entangle(&mut self, other_id: MessagePortId) {
         self.entangled_port = Some(other_id);
     }

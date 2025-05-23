@@ -18,10 +18,9 @@ use std::time::Duration;
 use base::Epoch;
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::{MessagePortId, PipelineId, WebViewId};
-use bitflags::bitflags;
 use embedder_traits::{
-    CompositorHitTestResult, Cursor, InputEvent, MediaSessionActionType, Theme, ViewportDetails,
-    WebDriverCommandMsg,
+    CompositorHitTestResult, Cursor, InputEvent, JavaScriptEvaluationId, MediaSessionActionType,
+    Theme, ViewportDetails, WebDriverCommandMsg,
 };
 use euclid::Vector2D;
 pub use from_script_message::*;
@@ -57,8 +56,9 @@ pub enum EmbedderToConstellationMessage {
     ChangeViewportDetails(WebViewId, ViewportDetails, WindowSizeType),
     /// Inform the constellation of a theme change.
     ThemeChange(Theme),
-    /// Requests that the constellation instruct layout to begin a new tick of the animation.
-    TickAnimation(PipelineId, AnimationTickType),
+    /// Requests that the constellation instruct script/layout to try to layout again and tick
+    /// animations.
+    TickAnimation(Vec<WebViewId>),
     /// Dispatch a webdriver command
     WebDriverCommand(WebDriverCommandMsg),
     /// Reload a top-level browsing context.
@@ -92,6 +92,9 @@ pub enum EmbedderToConstellationMessage {
     SetScrollStates(PipelineId, Vec<ScrollState>),
     /// Notify the constellation that a particular paint metric event has happened for the given pipeline.
     PaintMetric(PipelineId, PaintMetricEvent),
+    /// Evaluate a JavaScript string in the context of a `WebView`. When execution is complete or an
+    /// error is encountered, a correpsonding message will be sent to the embedding layer.
+    EvaluateJavaScript(WebViewId, JavaScriptEvaluationId, String),
 }
 
 /// A description of a paint metric that is sent from the Servo renderer to the
@@ -130,17 +133,6 @@ pub enum WindowSizeType {
     Resize,
 }
 
-bitflags! {
-    #[derive(Debug, Default, Deserialize, Serialize)]
-    /// Specifies if rAF should be triggered and/or CSS Animations and Transitions.
-    pub struct AnimationTickType: u8 {
-        /// Trigger a call to requestAnimationFrame.
-        const REQUEST_ANIMATION_FRAME = 0b001;
-        /// Trigger restyles for CSS Animations and Transitions.
-        const CSS_ANIMATIONS_AND_TRANSITIONS = 0b010;
-    }
-}
-
 /// The scroll state of a stacking context.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ScrollState {
@@ -168,18 +160,29 @@ pub struct PortMessageTask {
     pub data: StructuredSerializedData,
 }
 
+/// The information needed by a global to process the transfer of a port.
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct PortTransferInfo {
+    /// <https://html.spec.whatwg.org/multipage/#port-message-queue>
+    pub port_message_queue: VecDeque<PortMessageTask>,
+    /// A boolean indicating whether the port has been disentangled while in transfer,
+    /// if so, the disentanglement should be completed along with the transfer.
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    pub disentangled: bool,
+}
+
 /// Messages for communication between the constellation and a global managing ports.
 #[derive(Debug, Deserialize, Serialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum MessagePortMsg {
     /// Complete the transfer for a batch of ports.
-    CompleteTransfer(HashMap<MessagePortId, VecDeque<PortMessageTask>>),
+    CompleteTransfer(HashMap<MessagePortId, PortTransferInfo>),
     /// Complete the transfer of a single port,
     /// whose transfer was pending because it had been requested
     /// while a previous failed transfer was being rolled-back.
-    CompletePendingTransfer(MessagePortId, VecDeque<PortMessageTask>),
-    /// Remove a port, the entangled one doesn't exists anymore.
-    RemoveMessagePort(MessagePortId),
+    CompletePendingTransfer(MessagePortId, PortTransferInfo),
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    CompleteDisentanglement(MessagePortId),
     /// Handle a new port-message-task.
     NewTask(MessagePortId, PortMessageTask),
 }

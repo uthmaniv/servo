@@ -5,13 +5,16 @@
 use app_units::Au;
 use atomic_refcell::AtomicRef;
 use compositing_traits::display_list::AxesScrollSensitivity;
+use euclid::Rect;
+use euclid::default::Size2D as UntypedSize2D;
 use malloc_size_of_derive::MallocSizeOf;
+use script::layout_dom::ServoLayoutNode;
 use script_layout_interface::wrapper_traits::{
     LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
 use script_layout_interface::{LayoutElementType, LayoutNodeType};
 use servo_arc::Arc;
-use style::dom::OpaqueNode;
+use style::dom::{NodeInfo, TNode};
 use style::properties::ComputedValues;
 use style::values::computed::Overflow;
 use style_traits::CSSPixel;
@@ -26,10 +29,10 @@ use crate::flow::inline::InlineItem;
 use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::FragmentTree;
-use crate::geom::{LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSize};
+use crate::geom::{LogicalVec2, PhysicalRect, PhysicalSize};
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
 use crate::replaced::ReplacedContents;
-use crate::style_ext::{ComputedValuesExt, Display, DisplayGeneratingBox, DisplayInside};
+use crate::style_ext::{Display, DisplayGeneratingBox, DisplayInside};
 use crate::taffy::{TaffyItemBox, TaffyItemBoxInner};
 use crate::{DefiniteContainingBlock, PropagatedBoxTreeData};
 
@@ -39,18 +42,12 @@ pub struct BoxTree {
     /// There may be zero if that element has `display: none`.
     root: BlockFormattingContext,
 
-    /// <https://drafts.csswg.org/css-backgrounds/#special-backgrounds>
-    canvas_background: CanvasBackground,
-
     /// Whether or not the viewport should be sensitive to scrolling input events in two axes
     viewport_scroll_sensitivity: AxesScrollSensitivity,
 }
 
 impl BoxTree {
-    pub fn construct<'dom, Node>(context: &LayoutContext, root_element: Node) -> Self
-    where
-        Node: 'dom + Copy + LayoutNode<'dom> + Send + Sync,
-    {
+    pub fn construct(context: &LayoutContext, root_element: ServoLayoutNode<'_>) -> Self {
         let boxes = construct_for_root_element(context, root_element);
 
         // Zero box for `:root { display: none }`, one for the root element otherwise.
@@ -64,7 +61,7 @@ impl BoxTree {
         // > none, user agents must instead apply the overflow-* values of the first such child
         // > element to the viewport. The element from which the value is propagated must then have a
         // > used overflow value of visible.
-        let root_style = root_element.style(context);
+        let root_style = root_element.style(context.shared_context());
 
         let mut viewport_overflow_x = root_style.clone_overflow_x();
         let mut viewport_overflow_y = root_style.clone_overflow_y();
@@ -81,7 +78,7 @@ impl BoxTree {
                     continue;
                 }
 
-                let style = child.style(context);
+                let style = child.style(context.shared_context());
                 if !style.get_box().display.is_none() {
                     viewport_overflow_x = style.clone_overflow_x();
                     viewport_overflow_y = style.clone_overflow_y();
@@ -98,7 +95,6 @@ impl BoxTree {
                 contents,
                 contains_floats,
             },
-            canvas_background: CanvasBackground::for_root_element(context, root_element),
             // From https://www.w3.org/TR/css-overflow-3/#overflow-propagation:
             // > If visible is applied to the viewport, it must be interpreted as auto.
             // > If clip is applied to the viewport, it must be interpreted as hidden.
@@ -129,10 +125,7 @@ impl BoxTree {
     /// * how intrinsic content sizes are computed eagerly makes it hard
     ///   to update those sizes for ancestors of the node from which we
     ///   made an incremental update.
-    pub fn update<'dom, Node>(context: &LayoutContext, mut dirty_node: Node) -> bool
-    where
-        Node: 'dom + Copy + LayoutNode<'dom> + Send + Sync,
-    {
+    pub fn update(context: &LayoutContext, mut dirty_node: ServoLayoutNode<'_>) -> bool {
         #[allow(clippy::enum_variant_names)]
         enum UpdatePoint {
             AbsolutelyPositionedBlockLevelBox(ArcRefCell<BlockLevelBox>),
@@ -141,12 +134,9 @@ impl BoxTree {
             AbsolutelyPositionedTaffyLevelBox(ArcRefCell<TaffyItemBox>),
         }
 
-        fn update_point<'dom, Node>(
-            node: Node,
-        ) -> Option<(Arc<ComputedValues>, DisplayInside, UpdatePoint)>
-        where
-            Node: NodeExt<'dom>,
-        {
+        fn update_point(
+            node: ServoLayoutNode<'_>,
+        ) -> Option<(Arc<ComputedValues>, DisplayInside, UpdatePoint)> {
             if !node.is_element() {
                 return None;
             }
@@ -162,7 +152,7 @@ impl BoxTree {
                 return None;
             }
 
-            let layout_data = node.layout_data()?;
+            let layout_data = NodeExt::layout_data(&node)?;
             if layout_data.pseudo_before_box.borrow().is_some() {
                 return None;
             }
@@ -186,7 +176,7 @@ impl BoxTree {
 
             let update_point =
                 match &*AtomicRef::filter_map(layout_data.self_box.borrow(), Option::as_ref)? {
-                    LayoutBox::DisplayContents => return None,
+                    LayoutBox::DisplayContents(..) => return None,
                     LayoutBox::BlockLevel(block_level_box) => match &*block_level_box.borrow() {
                         BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(_)
                             if box_style.position.is_absolutely_positioned() =>
@@ -195,16 +185,17 @@ impl BoxTree {
                         },
                         _ => return None,
                     },
-                    LayoutBox::InlineLevel(inline_level_box) => match &*inline_level_box.borrow() {
-                        InlineItem::OutOfFlowAbsolutelyPositionedBox(_, text_offset_index)
-                            if box_style.position.is_absolutely_positioned() =>
-                        {
-                            UpdatePoint::AbsolutelyPositionedInlineLevelBox(
-                                inline_level_box.clone(),
-                                *text_offset_index,
-                            )
-                        },
-                        _ => return None,
+                    LayoutBox::InlineLevel(inline_level_items) => {
+                        let inline_level_box = inline_level_items.first()?;
+                        let InlineItem::OutOfFlowAbsolutelyPositionedBox(_, text_offset_index) =
+                            &*inline_level_box.borrow()
+                        else {
+                            return None;
+                        };
+                        UpdatePoint::AbsolutelyPositionedInlineLevelBox(
+                            inline_level_box.clone(),
+                            *text_offset_index,
+                        )
                     },
                     LayoutBox::FlexLevel(flex_level_box) => match &*flex_level_box.borrow() {
                         FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(_)
@@ -300,11 +291,11 @@ impl BoxTree {
     }
 }
 
-fn construct_for_root_element<'dom>(
+fn construct_for_root_element(
     context: &LayoutContext,
-    root_element: impl NodeExt<'dom>,
+    root_element: ServoLayoutNode<'_>,
 ) -> Vec<ArcRefCell<BlockLevelBox>> {
-    let info = NodeAndStyleInfo::new(root_element, root_element.style(context));
+    let info = NodeAndStyleInfo::new(root_element, root_element.style(context.shared_context()));
     let box_style = info.style.get_box();
 
     let display_inside = match Display::from(box_style.display) {
@@ -325,7 +316,7 @@ fn construct_for_root_element<'dom>(
     let contents = ReplacedContents::for_element(root_element, context)
         .map_or_else(|| NonReplacedContents::OfElement.into(), Contents::Replaced);
 
-    let propagated_data = PropagatedBoxTreeData::default().union(&info.style);
+    let propagated_data = PropagatedBoxTreeData::default();
     let root_box = if box_style.position.is_absolutely_positioned() {
         BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(ArcRefCell::new(
             AbsolutelyPositionedBox::construct(context, &info, display_inside, contents),
@@ -359,7 +350,7 @@ impl BoxTree {
     pub fn layout(
         &self,
         layout_context: &LayoutContext,
-        viewport: euclid::Size2D<f32, CSSPixel>,
+        viewport: UntypedSize2D<Au>,
     ) -> FragmentTree {
         let style = layout_context
             .style_context
@@ -369,13 +360,8 @@ impl BoxTree {
 
         // FIXME: use the document’s mode:
         // https://drafts.csswg.org/css-writing-modes/#principal-flow
-        let physical_containing_block = PhysicalRect::new(
-            PhysicalPoint::zero(),
-            PhysicalSize::new(
-                Au::from_f32_px(viewport.width),
-                Au::from_f32_px(viewport.height),
-            ),
-        );
+        let physical_containing_block: Rect<Au, CSSPixel> =
+            PhysicalSize::from_untyped(viewport).into();
         let initial_containing_block = DefiniteContainingBlock {
             size: LogicalVec2 {
                 inline: physical_containing_block.size.width,
@@ -384,8 +370,7 @@ impl BoxTree {
             style,
         };
 
-        let mut positioning_context =
-            PositioningContext::new_for_containing_block_for_all_descendants();
+        let mut positioning_context = PositioningContext::default();
         let independent_layout = self.root.layout(
             layout_context,
             &mut positioning_context,
@@ -410,7 +395,7 @@ impl BoxTree {
         let scrollable_overflow = root_fragments
             .iter()
             .fold(PhysicalRect::zero(), |acc, child| {
-                let child_overflow = child.scrollable_overflow();
+                let child_overflow = child.scrollable_overflow_for_parent();
 
                 // https://drafts.csswg.org/css-overflow/#scrolling-direction
                 // We want to clip scrollable overflow on box-start and inline-start
@@ -428,73 +413,12 @@ impl BoxTree {
                 acc.union(&child_overflow)
             });
 
-        FragmentTree {
+        FragmentTree::new(
+            layout_context,
             root_fragments,
             scrollable_overflow,
-            initial_containing_block: physical_containing_block,
-            canvas_background: self.canvas_background.clone(),
-            viewport_scroll_sensitivity: self.viewport_scroll_sensitivity,
-        }
-    }
-}
-
-/// <https://drafts.csswg.org/css-backgrounds/#root-background>
-#[derive(Clone, MallocSizeOf)]
-pub struct CanvasBackground {
-    /// DOM node for the root element
-    pub root_element: OpaqueNode,
-
-    /// The element whose style the canvas takes background properties from (see next field).
-    /// This can be the root element (same as the previous field), or the HTML `<body>` element.
-    /// See <https://drafts.csswg.org/css-backgrounds/#body-background>
-    pub from_element: OpaqueNode,
-
-    /// The computed styles to take background properties from.
-    #[conditional_malloc_size_of]
-    pub style: Option<Arc<ComputedValues>>,
-}
-
-impl CanvasBackground {
-    fn for_root_element<'dom>(context: &LayoutContext, root_element: impl NodeExt<'dom>) -> Self {
-        let root_style = root_element.style(context);
-
-        let mut style = root_style;
-        let mut from_element = root_element;
-
-        // https://drafts.csswg.org/css-backgrounds/#body-background
-        // “if the computed value of background-image on the root element is none
-        //  and its background-color is transparent”
-        if style.background_is_transparent() &&
-            // “For documents whose root element is an HTML `HTML` element
-            //  or an XHTML `html` element”
-            root_element.type_id() == LayoutNodeType::Element(LayoutElementType::HTMLHtmlElement) &&
-            // Don’t try to access styles for an unstyled subtree
-            !matches!(style.clone_display().into(), Display::None)
-        {
-            // “that element’s first HTML `BODY` or XHTML `body` child element”
-            if let Some(body) = iter_child_nodes(root_element).find(|child| {
-                child.is_element() &&
-                    child.type_id() ==
-                        LayoutNodeType::Element(LayoutElementType::HTMLBodyElement)
-            }) {
-                style = body.style(context);
-                from_element = body;
-            }
-        }
-
-        Self {
-            root_element: root_element.opaque(),
-            from_element: from_element.opaque(),
-
-            // “However, if no boxes are generated for the element
-            //  whose background would be used for the canvas
-            //  (for example, if the root element has display: none),
-            //  then the canvas background is transparent.”
-            style: if let Display::GeneratingBox(_) = style.clone_display().into() {
-                Some(style)
-            } else {
-                None
-            },
-        }
+            physical_containing_block,
+            self.viewport_scroll_sensitivity,
+        )
     }
 }

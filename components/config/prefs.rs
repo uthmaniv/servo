@@ -99,7 +99,6 @@ pub struct Preferences {
     pub dom_serviceworker_timeout_seconds: i64,
     pub dom_servo_helpers_enabled: bool,
     pub dom_servoparser_async_html_tokenizer_enabled: bool,
-    pub dom_shadowdom_enabled: bool,
     pub dom_svg_enabled: bool,
     pub dom_testable_crash_enabled: bool,
     pub dom_testbinding_enabled: bool,
@@ -236,6 +235,8 @@ pub struct Preferences {
     /// The user-agent to use for Servo. This can also be set via [`UserAgentPlatform`] in
     /// order to set the value to the default value for the given platform.
     pub user_agent: String,
+
+    pub log_filter: String,
 }
 
 impl Preferences {
@@ -275,7 +276,6 @@ impl Preferences {
             dom_serviceworker_timeout_seconds: 60,
             dom_servo_helpers_enabled: false,
             dom_servoparser_async_html_tokenizer_enabled: false,
-            dom_shadowdom_enabled: true,
             dom_svg_enabled: false,
             dom_testable_crash_enabled: false,
             dom_testbinding_enabled: false,
@@ -398,6 +398,7 @@ impl Preferences {
             threadpools_webrender_workers_max: 4,
             webgl_testing_context_creation_error: false,
             user_agent: String::new(),
+            log_filter: String::new(),
         }
     }
 }

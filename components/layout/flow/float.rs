@@ -22,7 +22,6 @@ use style::properties::ComputedValues;
 use style::values::computed::Clear as StyleClear;
 
 use crate::context::LayoutContext;
-use crate::dom::NodeExt;
 use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::{BoxFragment, CollapsedMargin};
@@ -885,9 +884,9 @@ impl FloatBandLink {
 
 impl FloatBox {
     /// Creates a new float box.
-    pub fn construct<'dom>(
+    pub fn construct(
         context: &LayoutContext,
-        info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        info: &NodeAndStyleInfo<'_>,
         display_inside: DisplayInside,
         contents: Contents,
         propagated_data: PropagatedBoxTreeData,
@@ -898,8 +897,7 @@ impl FloatBox {
                 info,
                 display_inside,
                 contents,
-                // Text decorations are not propagated to any out-of-flow descendants
-                propagated_data.without_text_decorations(),
+                propagated_data,
             ),
         }
     }
@@ -913,11 +911,10 @@ impl FloatBox {
         positioning_context: &mut PositioningContext,
         containing_block: &ContainingBlock,
     ) -> BoxFragment {
-        let style = self.contents.style().clone();
         positioning_context.layout_maybe_position_relative_fragment(
             layout_context,
             containing_block,
-            &style,
+            &self.contents.base,
             |positioning_context| {
                 self.contents
                     .layout_float_or_atomic_inline(

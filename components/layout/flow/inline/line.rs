@@ -7,7 +7,6 @@ use bitflags::bitflags;
 use fonts::{ByteIndex, FontMetrics, GlyphStore};
 use itertools::Either;
 use range::Range;
-use servo_arc::Arc;
 use style::Zero;
 use style::computed_values::position::T as Position;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
@@ -16,12 +15,11 @@ use style::values::generics::box_::{GenericVerticalAlign, VerticalAlignKeyword};
 use style::values::generics::font::LineHeight;
 use style::values::specified::align::AlignFlags;
 use style::values::specified::box_::DisplayOutside;
-use style::values::specified::text::TextDecorationLine;
 use unicode_bidi::{BidiInfo, Level};
 use webrender_api::FontInstanceKey;
 
 use super::inline_box::{InlineBoxContainerState, InlineBoxIdentifier, InlineBoxTreePathToken};
-use super::{InlineFormattingContextLayout, LineBlockSizes};
+use super::{InlineFormattingContextLayout, LineBlockSizes, SharedInlineStyles};
 use crate::cell::ArcRefCell;
 use crate::fragment_tree::{BaseFragmentInfo, BoxFragment, Fragment, TextFragment};
 use crate::geom::{LogicalRect, LogicalVec2, PhysicalRect, ToLogical};
@@ -326,13 +324,12 @@ impl LineItemLayout<'_, '_> {
         let inline_box = self.layout.ifc.inline_boxes.get(identifier);
         let inline_box = &*(inline_box.borrow());
 
-        let style = &inline_box.base.style;
         let space_above_baseline = inline_box_state.calculate_space_above_baseline();
         let block_start_offset =
             self.calculate_inline_box_block_start(inline_box_state, space_above_baseline);
 
         let positioning_context_or_start_offset_in_parent =
-            match PositioningContext::new_for_style(style) {
+            match PositioningContext::new_for_layout_box_base(&inline_box.base) {
                 Some(positioning_context) => Either::Left(positioning_context),
                 None => Either::Right(self.current_positioning_context_mut().len()),
             };
@@ -569,15 +566,13 @@ impl LineItemLayout<'_, '_> {
         self.current_state.fragments.push((
             Fragment::Text(ArcRefCell::new(TextFragment {
                 base: text_item.base_fragment_info.into(),
-                parent_style: text_item.parent_style,
+                inline_styles: text_item.inline_styles.clone(),
                 rect: PhysicalRect::zero(),
                 font_metrics: text_item.font_metrics,
                 font_key: text_item.font_key,
                 glyphs: text_item.text,
-                text_decoration_line: text_item.text_decoration_line,
                 justification_adjustment: self.justification_adjustment,
                 selection_range: text_item.selection_range,
-                selected_style: text_item.selected_style,
             })),
             content_rect,
         ));
@@ -764,21 +759,23 @@ impl LineItem {
 
 pub(super) struct TextRunLineItem {
     pub base_fragment_info: BaseFragmentInfo,
-    pub parent_style: Arc<ComputedValues>,
+    pub inline_styles: SharedInlineStyles,
     pub text: Vec<std::sync::Arc<GlyphStore>>,
     pub font_metrics: FontMetrics,
     pub font_key: FontInstanceKey,
-    pub text_decoration_line: TextDecorationLine,
     /// The BiDi level of this [`TextRunLineItem`] to enable reordering.
     pub bidi_level: Level,
     pub selection_range: Option<Range<ByteIndex>>,
-    pub selected_style: Arc<ComputedValues>,
 }
 
 impl TextRunLineItem {
     fn trim_whitespace_at_end(&mut self, whitespace_trimmed: &mut Au) -> bool {
         if matches!(
-            self.parent_style.get_inherited_text().white_space_collapse,
+            self.inline_styles
+                .style
+                .borrow()
+                .get_inherited_text()
+                .white_space_collapse,
             WhiteSpaceCollapse::Preserve | WhiteSpaceCollapse::BreakSpaces
         ) {
             return false;
@@ -804,7 +801,11 @@ impl TextRunLineItem {
 
     fn trim_whitespace_at_start(&mut self, whitespace_trimmed: &mut Au) -> bool {
         if matches!(
-            self.parent_style.get_inherited_text().white_space_collapse,
+            self.inline_styles
+                .style
+                .borrow()
+                .get_inherited_text()
+                .white_space_collapse,
             WhiteSpaceCollapse::Preserve | WhiteSpaceCollapse::BreakSpaces
         ) {
             return false;

@@ -4,9 +4,8 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::{Cell, LazyCell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::process;
 use std::sync::{Arc, LazyLock};
@@ -16,14 +15,13 @@ use base::Epoch;
 use base::id::{PipelineId, WebViewId};
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::ScrollState;
-use embedder_traits::resources::{self, Resource};
 use embedder_traits::{UntrustedNodeAddress, ViewportDetails};
-use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
+use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect};
 use euclid::{Point2D, Scale, Size2D, Vector2D};
 use fnv::FnvHashMap;
 use fonts::{FontContext, FontContextWebFontMethods};
 use fonts_traits::StylesheetWebFontLoadFinishedCallback;
-use fxhash::{FxHashMap, FxHashSet};
+use fxhash::FxHashMap;
 use ipc_channel::ipc::IpcSender;
 use log::{debug, error};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf, MallocSizeOfOps};
@@ -34,21 +32,22 @@ use profile_traits::time::{
     self as profile_time, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
 };
 use profile_traits::{path, time_profile};
-use script::layout_dom::{ServoLayoutElement, ServoLayoutNode};
+use rayon::ThreadPool;
+use script::layout_dom::{ServoLayoutDocument, ServoLayoutElement, ServoLayoutNode};
 use script_layout_interface::{
-    ImageAnimationState, Layout, LayoutConfig, LayoutFactory, NodesFromPointQueryType,
-    OffsetParentResponse, ReflowGoal, ReflowRequest, ReflowResult, TrustedNodeAddress,
+    Layout, LayoutConfig, LayoutFactory, NodesFromPointQueryType, OffsetParentResponse, ReflowGoal,
+    ReflowRequest, ReflowResult, TrustedNodeAddress,
 };
 use script_traits::{DrawAPaintImageResult, PaintWorkletError, Painter, ScriptThreadMessage};
 use servo_arc::Arc as ServoArc;
 use servo_config::opts::{self, DebugOptions};
 use servo_config::pref;
 use servo_url::ServoUrl;
-use style::animation::{AnimationSetKey, DocumentAnimationSet};
+use style::animation::DocumentAnimationSet;
 use style::context::{
     QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters, SharedStyleContext,
 };
-use style::dom::{OpaqueNode, TElement, TNode};
+use style::dom::{OpaqueNode, ShowSubtreeDataAndPrimaryValues, TElement, TNode};
 use style::error_reporting::RustLogReporter;
 use style::font_metrics::FontMetrics;
 use style::global_style_data::GLOBAL_STYLE_DATA;
@@ -57,7 +56,7 @@ use style::media_queries::{Device, MediaList, MediaType};
 use style::properties::style_structs::Font;
 use style::properties::{ComputedValues, PropertyId};
 use style::queries::values::PrefersColorScheme;
-use style::selector_parser::{PseudoElement, SnapshotMap};
+use style::selector_parser::{PseudoElement, RestyleDamage, SnapshotMap};
 use style::servo::media_queries::FontMetricsProvider;
 use style::shared_lock::{SharedRwLock, SharedRwLockReadGuard, StylesheetGuards};
 use style::stylesheets::{
@@ -69,7 +68,7 @@ use style::traversal::DomTraversal;
 use style::traversal_flags::TraversalFlags;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{CSSPixelLength, FontSize, Length, NonNegativeLength};
-use style::values::specified::font::KeywordInfo;
+use style::values::specified::font::{KeywordInfo, QueryFontMetricsFlags};
 use style::{Zero, driver};
 use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
@@ -78,13 +77,13 @@ use webrender_api::units::{DevicePixel, DevicePoint, LayoutPixel, LayoutPoint, L
 use webrender_api::{ExternalScrollId, HitTestFlags};
 
 use crate::context::LayoutContext;
-use crate::display_list::{DisplayList, WebRenderImageInfo};
+use crate::display_list::{DisplayListBuilder, StackingContextTree, WebRenderImageInfo};
 use crate::query::{
-    get_the_text_steps, process_content_box_request, process_content_boxes_request,
-    process_node_geometry_request, process_node_scroll_area_request, process_offset_parent_query,
+    get_the_text_steps, process_client_rect_request, process_content_box_request,
+    process_content_boxes_request, process_node_scroll_area_request, process_offset_parent_query,
     process_resolved_font_style_query, process_resolved_style_request, process_text_index_request,
 };
-use crate::traversal::RecalcStyle;
+use crate::traversal::{RecalcStyle, compute_damage_and_repair_style};
 use crate::{BoxTree, FragmentTree};
 
 // This mutex is necessary due to syncronisation issues between two different types of thread-local storage
@@ -94,6 +93,18 @@ use crate::{BoxTree, FragmentTree};
 // And: https://gist.github.com/mukilan/ed57eb61b83237a05fbf6360ec5e33b0
 static STYLE_THREAD_POOL: Mutex<&style::global_style_data::STYLE_THREAD_POOL> =
     Mutex::new(&style::global_style_data::STYLE_THREAD_POOL);
+
+/// A CSS file to style the user agent stylesheet.
+static USER_AGENT_CSS: &[u8] = include_bytes!("./stylesheets/user-agent.css");
+
+/// A CSS file to style the Servo browser.
+static SERVO_CSS: &[u8] = include_bytes!("./stylesheets/servo.css");
+
+/// A CSS file to style the presentational hints.
+static PRESENTATIONAL_HINTS_CSS: &[u8] = include_bytes!("./stylesheets/presentational-hints.css");
+
+/// A CSS file to style the quirks mode.
+static QUIRKS_MODE_CSS: &[u8] = include_bytes!("./stylesheets/quirks-mode.css");
 
 /// Information needed by layout.
 pub struct LayoutThread {
@@ -133,12 +144,11 @@ pub struct LayoutThread {
     /// The fragment tree.
     fragment_tree: RefCell<Option<Arc<FragmentTree>>>,
 
+    /// The [`StackingContextTree`] cached from previous layouts.
+    stacking_context_tree: RefCell<Option<StackingContextTree>>,
+
     /// A counter for epoch messages
     epoch: Cell<Epoch>,
-
-    /// The size of the viewport. This may be different from the size of the screen due to viewport
-    /// constraints.
-    viewport_size: UntypedSize2D<Au>,
 
     /// Scroll offsets of nodes that scroll.
     scroll_offsets: RefCell<HashMap<ExternalScrollId, Vector2D<f32, LayoutPixel>>>,
@@ -230,24 +240,27 @@ impl Layout for LayoutThread {
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn query_content_box(&self, node: OpaqueNode) -> Option<UntypedRect<Au>> {
-        process_content_box_request(node, self.fragment_tree.borrow().clone())
+    fn query_content_box(&self, node: TrustedNodeAddress) -> Option<UntypedRect<Au>> {
+        let node = unsafe { ServoLayoutNode::new(&node) };
+        process_content_box_request(node)
     }
 
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn query_content_boxes(&self, node: OpaqueNode) -> Vec<UntypedRect<Au>> {
-        process_content_boxes_request(node, self.fragment_tree.borrow().clone())
+    fn query_content_boxes(&self, node: TrustedNodeAddress) -> Vec<UntypedRect<Au>> {
+        let node = unsafe { ServoLayoutNode::new(&node) };
+        process_content_boxes_request(node)
     }
 
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn query_client_rect(&self, node: OpaqueNode) -> UntypedRect<i32> {
-        process_node_geometry_request(node, self.fragment_tree.borrow().clone())
+    fn query_client_rect(&self, node: TrustedNodeAddress) -> UntypedRect<i32> {
+        let node = unsafe { ServoLayoutNode::new(&node) };
+        process_client_rect_request(node)
     }
 
     #[cfg_attr(
@@ -292,8 +305,9 @@ impl Layout for LayoutThread {
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn query_offset_parent(&self, node: OpaqueNode) -> OffsetParentResponse {
-        process_offset_parent_query(node, self.fragment_tree.borrow().clone())
+    fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse {
+        let node = unsafe { ServoLayoutNode::new(&node) };
+        process_offset_parent_query(node).unwrap_or_default()
     }
 
     #[cfg_attr(
@@ -325,14 +339,7 @@ impl Layout for LayoutThread {
             TraversalFlags::empty(),
         );
 
-        let fragment_tree = self.fragment_tree.borrow().clone();
-        process_resolved_style_request(
-            &shared_style_context,
-            node,
-            &pseudo,
-            &property_id,
-            fragment_tree,
-        )
+        process_resolved_style_request(&shared_style_context, node, &pseudo, &property_id)
     }
 
     #[cfg_attr(
@@ -375,7 +382,8 @@ impl Layout for LayoutThread {
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn query_scrolling_area(&self, node: Option<OpaqueNode>) -> UntypedRect<i32> {
+    fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> UntypedRect<i32> {
+        let node = node.map(|node| unsafe { ServoLayoutNode::new(&node) });
         process_node_scroll_area_request(node, self.fragment_tree.borrow().clone())
     }
 
@@ -438,6 +446,8 @@ impl Layout for LayoutThread {
                 .map(|tree| tree.conditional_size_of(ops))
                 .unwrap_or_default(),
         });
+
+        reports.push(self.image_cache.memory_report(formatted_url, ops));
     }
 
     fn set_quirks_mode(&mut self, quirks_mode: QuirksMode) {
@@ -510,12 +520,9 @@ impl LayoutThread {
             first_reflow: Cell::new(true),
             box_tree: Default::default(),
             fragment_tree: Default::default(),
+            stacking_context_tree: Default::default(),
             // Epoch starts at 1 because of the initial display list for epoch 0 that we send to WR
             epoch: Cell::new(Epoch(1)),
-            viewport_size: Size2D::new(
-                Au::from_f32_px(config.viewport_details.size.width),
-                Au::from_f32_px(config.viewport_details.size.height),
-            ),
             compositor_api: config.compositor_api,
             scroll_offsets: Default::default(),
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
@@ -542,43 +549,6 @@ impl LayoutThread {
             current_time_for_animations: animation_timeline_value,
             traversal_flags,
             snapshot_map,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    // Create a layout context for use in building display lists, hit testing, &c.
-    #[allow(clippy::too_many_arguments)]
-    fn build_layout_context<'a>(
-        &'a self,
-        guards: StylesheetGuards<'a>,
-        snapshot_map: &'a SnapshotMap,
-        reflow_request: &mut ReflowRequest,
-        use_rayon: bool,
-    ) -> LayoutContext<'a> {
-        let traversal_flags = match reflow_request.stylesheets_changed {
-            true => TraversalFlags::ForCSSRuleChanges,
-            false => TraversalFlags::empty(),
-        };
-
-        LayoutContext {
-            id: self.id,
-            origin: reflow_request.origin.clone(),
-            style_context: self.build_shared_style_context(
-                guards,
-                snapshot_map,
-                reflow_request.animation_timeline_value,
-                &reflow_request.animations,
-                traversal_flags,
-            ),
-            image_cache: self.image_cache.clone(),
-            font_context: self.font_context.clone(),
-            webrender_image_cache: self.webrender_image_cache.clone(),
-            pending_images: Mutex::default(),
-            node_image_animation_map: Arc::new(RwLock::new(std::mem::take(
-                &mut reflow_request.node_to_image_animation_map,
-            ))),
-            iframe_sizes: Mutex::default(),
-            use_rayon,
         }
     }
 
@@ -621,51 +591,132 @@ impl LayoutThread {
             return None;
         };
 
-        // Calculate the actual viewport as per DEVICE-ADAPT § 6
-        // If the entire flow tree is invalid, then it will be reflowed anyhow.
         let document_shared_lock = document.style_shared_lock();
         let author_guard = document_shared_lock.read();
-
         let ua_stylesheets = &*UA_STYLESHEETS;
         let ua_or_user_guard = ua_stylesheets.shared_lock.read();
+        let rayon_pool = STYLE_THREAD_POOL.lock();
+        let rayon_pool = rayon_pool.pool();
+        let rayon_pool = rayon_pool.as_ref();
         let guards = StylesheetGuards {
             author: &author_guard,
             ua_or_user: &ua_or_user_guard,
         };
 
-        let had_used_viewport_units = self.stylist.device().used_viewport_units();
-        let viewport_size_changed = self.viewport_did_change(reflow_request.viewport_details);
-        let theme_changed = self.theme_did_change(reflow_request.theme);
-
-        if viewport_size_changed || theme_changed {
-            self.update_device(
-                reflow_request.viewport_details,
-                reflow_request.theme,
-                &guards,
-            );
-        }
-
-        if viewport_size_changed && had_used_viewport_units {
+        let viewport_changed = self.viewport_did_change(reflow_request.viewport_details);
+        if self.update_device_if_necessary(&reflow_request, viewport_changed, &guards) {
             if let Some(mut data) = root_element.mutate_data() {
                 data.hint.insert(RestyleHint::recascade_subtree());
             }
         }
 
+        let mut snapshot_map = SnapshotMap::new();
+        let _snapshot_setter = SnapshotSetter::new(&mut reflow_request, &mut snapshot_map);
+        self.prepare_stylist_for_reflow(
+            &reflow_request,
+            document,
+            root_element,
+            &guards,
+            ua_stylesheets,
+            &snapshot_map,
+        );
+
+        let mut layout_context = LayoutContext {
+            id: self.id,
+            origin: reflow_request.origin.clone(),
+            style_context: self.build_shared_style_context(
+                guards,
+                &snapshot_map,
+                reflow_request.animation_timeline_value,
+                &reflow_request.animations,
+                match reflow_request.stylesheets_changed {
+                    true => TraversalFlags::ForCSSRuleChanges,
+                    false => TraversalFlags::empty(),
+                },
+            ),
+            image_cache: self.image_cache.clone(),
+            font_context: self.font_context.clone(),
+            webrender_image_cache: self.webrender_image_cache.clone(),
+            pending_images: Mutex::default(),
+            node_image_animation_map: Arc::new(RwLock::new(std::mem::take(
+                &mut reflow_request.node_to_image_animation_map,
+            ))),
+            iframe_sizes: Mutex::default(),
+            use_rayon: rayon_pool.is_some(),
+            highlighted_dom_node: reflow_request.highlighted_dom_node,
+        };
+
+        let did_reflow = self.restyle_and_build_trees(
+            &reflow_request,
+            root_element,
+            rayon_pool,
+            &mut layout_context,
+            viewport_changed,
+        );
+
+        self.build_stacking_context_tree(&reflow_request, did_reflow);
+        self.build_display_list(&reflow_request, &mut layout_context);
+
+        self.first_reflow.set(false);
+        if let ReflowGoal::UpdateScrollNode(scroll_state) = reflow_request.reflow_goal {
+            self.update_scroll_node_state(&scroll_state);
+        }
+
+        let pending_images = std::mem::take(&mut *layout_context.pending_images.lock());
+        let iframe_sizes = std::mem::take(&mut *layout_context.iframe_sizes.lock());
+        let node_to_image_animation_map =
+            std::mem::take(&mut *layout_context.node_image_animation_map.write());
+
+        Some(ReflowResult {
+            pending_images,
+            iframe_sizes,
+            node_to_image_animation_map,
+        })
+    }
+
+    fn update_device_if_necessary(
+        &mut self,
+        reflow_request: &ReflowRequest,
+        viewport_changed: bool,
+        guards: &StylesheetGuards,
+    ) -> bool {
+        let had_used_viewport_units = self.stylist.device().used_viewport_units();
+        let theme_changed = self.theme_did_change(reflow_request.theme);
+        if !viewport_changed && !theme_changed {
+            return false;
+        }
+        self.update_device(
+            reflow_request.viewport_details,
+            reflow_request.theme,
+            guards,
+        );
+        (viewport_changed && had_used_viewport_units) || theme_changed
+    }
+
+    fn prepare_stylist_for_reflow<'dom>(
+        &mut self,
+        reflow_request: &ReflowRequest,
+        document: ServoLayoutDocument<'dom>,
+        root_element: ServoLayoutElement<'dom>,
+        guards: &StylesheetGuards,
+        ua_stylesheets: &UserAgentStylesheets,
+        snapshot_map: &SnapshotMap,
+    ) {
         if self.first_reflow.get() {
             for stylesheet in &ua_stylesheets.user_or_user_agent_stylesheets {
                 self.stylist
-                    .append_stylesheet(stylesheet.clone(), &ua_or_user_guard);
-                self.load_all_web_fonts_from_stylesheet_with_guard(stylesheet, &ua_or_user_guard);
+                    .append_stylesheet(stylesheet.clone(), guards.ua_or_user);
+                self.load_all_web_fonts_from_stylesheet_with_guard(stylesheet, guards.ua_or_user);
             }
 
             if self.stylist.quirks_mode() != QuirksMode::NoQuirks {
                 self.stylist.append_stylesheet(
                     ua_stylesheets.quirks_mode_stylesheet.clone(),
-                    &ua_or_user_guard,
+                    guards.ua_or_user,
                 );
                 self.load_all_web_fonts_from_stylesheet_with_guard(
                     &ua_stylesheets.quirks_mode_stylesheet,
-                    &ua_or_user_guard,
+                    guards.ua_or_user,
                 );
             }
         }
@@ -678,153 +729,180 @@ impl LayoutThread {
         // Flush shadow roots stylesheets if dirty.
         document.flush_shadow_roots_stylesheets(&mut self.stylist, guards.author);
 
-        let restyles = std::mem::take(&mut reflow_request.pending_restyles);
-        debug!("Draining restyles: {}", restyles.len());
+        self.stylist
+            .flush(guards, Some(root_element), Some(snapshot_map));
+    }
 
-        let mut map = SnapshotMap::new();
-        let elements_with_snapshot: Vec<_> = restyles
-            .iter()
-            .filter(|r| r.1.snapshot.is_some())
-            .map(|r| unsafe { ServoLayoutNode::new(&r.0).as_element().unwrap() })
-            .collect();
-
-        for (el, restyle) in restyles {
-            let el = unsafe { ServoLayoutNode::new(&el).as_element().unwrap() };
-
-            // If we haven't styled this node yet, we don't need to track a
-            // restyle.
-            let mut style_data = match el.mutate_data() {
-                Some(d) => d,
-                None => {
-                    unsafe { el.unset_snapshot_flags() };
-                    continue;
-                },
-            };
-
-            if let Some(s) = restyle.snapshot {
-                unsafe { el.set_has_snapshot() };
-                map.insert(el.as_node().opaque(), s);
-            }
-
-            // Stash the data on the element for processing by the style system.
-            style_data.hint.insert(restyle.hint);
-            style_data.damage = restyle.damage;
-            debug!("Noting restyle for {:?}: {:?}", el, style_data);
-        }
-
-        self.stylist.flush(&guards, Some(root_element), Some(&map));
-
-        let rayon_pool = STYLE_THREAD_POOL.lock();
-        let rayon_pool = rayon_pool.pool();
-        let rayon_pool = rayon_pool.as_ref();
-
-        // Create a layout context for use throughout the following passes.
-        let mut layout_context = self.build_layout_context(
-            guards.clone(),
-            &map,
-            &mut reflow_request,
-            rayon_pool.is_some(),
-        );
-
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
+    fn restyle_and_build_trees(
+        &self,
+        reflow_request: &ReflowRequest,
+        root_element: ServoLayoutElement<'_>,
+        rayon_pool: Option<&ThreadPool>,
+        layout_context: &mut LayoutContext<'_>,
+        viewport_changed: bool,
+    ) -> bool {
         let dirty_root = unsafe {
             ServoLayoutNode::new(&reflow_request.dirty_root.unwrap())
                 .as_element()
                 .unwrap()
         };
 
-        let traversal = RecalcStyle::new(layout_context);
+        let recalc_style_traversal = RecalcStyle::new(layout_context);
         let token = {
-            let shared = DomTraversal::<ServoLayoutElement>::shared_context(&traversal);
+            let shared =
+                DomTraversal::<ServoLayoutElement>::shared_context(&recalc_style_traversal);
             RecalcStyle::pre_traverse(dirty_root, shared)
         };
 
-        if token.should_traverse() {
-            #[cfg(feature = "tracing")]
-            let _span =
-                tracing::trace_span!("driver::traverse_dom", servo_profiling = true).entered();
-            let dirty_root: ServoLayoutNode =
-                driver::traverse_dom(&traversal, token, rayon_pool).as_node();
-
-            let root_node = root_element.as_node();
-            let mut box_tree = self.box_tree.borrow_mut();
-            let box_tree = &mut *box_tree;
-            let mut build_box_tree = || {
-                if !BoxTree::update(traversal.context(), dirty_root) {
-                    *box_tree = Some(Arc::new(BoxTree::construct(traversal.context(), root_node)));
-                }
-            };
-            if let Some(pool) = rayon_pool {
-                pool.install(build_box_tree)
-            } else {
-                build_box_tree()
-            };
-
-            let viewport_size = Size2D::new(
-                self.viewport_size.width.to_f32_px(),
-                self.viewport_size.height.to_f32_px(),
-            );
-            let run_layout = || {
-                box_tree
-                    .as_ref()
-                    .unwrap()
-                    .layout(traversal.context(), viewport_size)
-            };
-            let fragment_tree = Arc::new(if let Some(pool) = rayon_pool {
-                pool.install(run_layout)
-            } else {
-                run_layout()
-            });
-            *self.fragment_tree.borrow_mut() = Some(fragment_tree);
+        if !token.should_traverse() {
+            layout_context.style_context.stylist.rule_tree().maybe_gc();
+            return false;
         }
 
-        layout_context = traversal.destroy();
+        let dirty_root: ServoLayoutNode =
+            driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node();
 
-        for element in elements_with_snapshot {
-            unsafe { element.unset_snapshot_flags() }
+        let root_node = root_element.as_node();
+        let damage = compute_damage_and_repair_style(layout_context.shared_context(), root_node);
+        if !viewport_changed && (damage.is_empty() || damage == RestyleDamage::REPAINT) {
+            layout_context.style_context.stylist.rule_tree().maybe_gc();
+            return false;
         }
+
+        let mut box_tree = self.box_tree.borrow_mut();
+        let box_tree = &mut *box_tree;
+        let mut build_box_tree = || {
+            if !BoxTree::update(recalc_style_traversal.context(), dirty_root) {
+                *box_tree = Some(Arc::new(BoxTree::construct(
+                    recalc_style_traversal.context(),
+                    root_node,
+                )));
+            }
+        };
+        if let Some(pool) = rayon_pool {
+            pool.install(build_box_tree)
+        } else {
+            build_box_tree()
+        };
+
+        let viewport_size = self.stylist.device().au_viewport_size();
+        let run_layout = || {
+            box_tree
+                .as_ref()
+                .unwrap()
+                .layout(recalc_style_traversal.context(), viewport_size)
+        };
+        let fragment_tree = Arc::new(if let Some(pool) = rayon_pool {
+            pool.install(run_layout)
+        } else {
+            run_layout()
+        });
+
+        if self.debug.dump_flow_tree {
+            fragment_tree.print();
+        }
+        *self.fragment_tree.borrow_mut() = Some(fragment_tree);
+
+        // The FragmentTree has been updated, so any existing StackingContext tree that layout
+        // had is now out of date and should be rebuilt.
+        *self.stacking_context_tree.borrow_mut() = None;
 
         if self.debug.dump_style_tree {
             println!(
                 "{:?}",
-                style::dom::ShowSubtreeDataAndPrimaryValues(root_element.as_node())
+                ShowSubtreeDataAndPrimaryValues(root_element.as_node())
             );
         }
-
         if self.debug.dump_rule_tree {
-            layout_context
+            recalc_style_traversal
+                .context()
                 .style_context
                 .stylist
                 .rule_tree()
-                .dump_stdout(&guards);
+                .dump_stdout(&layout_context.shared_context().guards);
         }
 
         // GC the rule tree if some heuristics are met.
         layout_context.style_context.stylist.rule_tree().maybe_gc();
+        true
+    }
 
-        // Perform post-style recalculation layout passes.
-        if let Some(root) = &*self.fragment_tree.borrow() {
-            self.perform_post_style_recalc_layout_passes(
-                root.clone(),
-                &reflow_request.reflow_goal,
-                &mut layout_context,
-            );
+    fn build_stacking_context_tree(&self, reflow_request: &ReflowRequest, did_reflow: bool) {
+        if !reflow_request.reflow_goal.needs_display_list() &&
+            !reflow_request.reflow_goal.needs_display()
+        {
+            return;
+        }
+        let Some(fragment_tree) = &*self.fragment_tree.borrow() else {
+            return;
+        };
+        if !did_reflow && self.stacking_context_tree.borrow().is_some() {
+            return;
         }
 
-        self.first_reflow.set(false);
+        let viewport_size = self.stylist.device().au_viewport_size();
+        let viewport_size = LayoutSize::new(
+            viewport_size.width.to_f32_px(),
+            viewport_size.height.to_f32_px(),
+        );
 
-        if let ReflowGoal::UpdateScrollNode(scroll_state) = reflow_request.reflow_goal {
-            self.update_scroll_node_state(&scroll_state);
+        // Build the StackingContextTree. This turns the `FragmentTree` into a
+        // tree of fragments in CSS painting order and also creates all
+        // applicable spatial and clip nodes.
+        *self.stacking_context_tree.borrow_mut() = Some(StackingContextTree::new(
+            fragment_tree,
+            viewport_size,
+            fragment_tree.scrollable_overflow(),
+            self.id.into(),
+            fragment_tree.viewport_scroll_sensitivity,
+            self.first_reflow.get(),
+            &self.debug,
+        ));
+    }
+
+    fn build_display_list(
+        &self,
+        reflow_request: &ReflowRequest,
+        layout_context: &mut LayoutContext<'_>,
+    ) {
+        if !reflow_request.reflow_goal.needs_display() {
+            return;
         }
+        let Some(fragment_tree) = &*self.fragment_tree.borrow() else {
+            return;
+        };
 
-        let pending_images = std::mem::take(&mut *layout_context.pending_images.lock());
-        let iframe_sizes = std::mem::take(&mut *layout_context.iframe_sizes.lock());
-        let node_to_image_animation_map =
-            std::mem::take(&mut *layout_context.node_image_animation_map.write());
-        Some(ReflowResult {
-            pending_images,
-            iframe_sizes,
-            node_to_image_animation_map,
-        })
+        let mut stacking_context_tree = self.stacking_context_tree.borrow_mut();
+        let Some(stacking_context_tree) = stacking_context_tree.as_mut() else {
+            return;
+        };
+
+        let mut epoch = self.epoch.get();
+        epoch.next();
+        self.epoch.set(epoch);
+        stacking_context_tree.compositor_info.epoch = epoch.into();
+
+        let built_display_list = DisplayListBuilder::build(
+            layout_context,
+            stacking_context_tree,
+            fragment_tree,
+            &self.debug,
+        );
+        self.compositor_api.send_display_list(
+            self.webview_id,
+            &stacking_context_tree.compositor_info,
+            built_display_list,
+        );
+
+        let (keys, instance_keys) = self
+            .font_context
+            .collect_unused_webrender_resources(false /* all */);
+        self.compositor_api
+            .remove_unused_font_resources(keys, instance_keys)
     }
 
     fn update_scroll_node_state(&self, state: &ScrollState) {
@@ -838,84 +916,6 @@ impl LayoutThread {
             LayoutPoint::from_untyped(point),
             state.scroll_id,
         );
-    }
-
-    fn perform_post_style_recalc_layout_passes(
-        &self,
-        fragment_tree: Arc<FragmentTree>,
-        reflow_goal: &ReflowGoal,
-        context: &mut LayoutContext,
-    ) {
-        Self::cancel_animations_for_nodes_not_in_fragment_tree(
-            &context.style_context.animations,
-            &fragment_tree,
-        );
-
-        Self::cancel_image_animation_for_nodes_not_in_fragment_tree(
-            context.node_image_animation_map.clone(),
-            &fragment_tree,
-        );
-
-        if !reflow_goal.needs_display_list() {
-            return;
-        }
-
-        let mut epoch = self.epoch.get();
-        epoch.next();
-        self.epoch.set(epoch);
-
-        let viewport_size = LayoutSize::from_untyped(Size2D::new(
-            self.viewport_size.width.to_f32_px(),
-            self.viewport_size.height.to_f32_px(),
-        ));
-        let mut display_list = DisplayList::new(
-            viewport_size,
-            fragment_tree.scrollable_overflow(),
-            self.id.into(),
-            epoch.into(),
-            fragment_tree.viewport_scroll_sensitivity,
-            self.first_reflow.get(),
-        );
-        display_list.wr.begin();
-
-        // `dump_serialized_display_list` doesn't actually print anything. It sets up
-        // the display list for printing the serialized version when `finalize()` is called.
-        // We need to call this before adding any display items so that they are printed
-        // during `finalize()`.
-        if self.debug.dump_display_list {
-            display_list.wr.dump_serialized_display_list();
-        }
-
-        // Build the root stacking context. This turns the `FragmentTree` into a
-        // tree of fragments in CSS painting order and also creates all
-        // applicable spatial and clip nodes.
-        let root_stacking_context =
-            display_list.build_stacking_context_tree(&fragment_tree, &self.debug);
-
-        // Build the rest of the display list which inclues all of the WebRender primitives.
-        display_list.build(context, &fragment_tree, &root_stacking_context);
-
-        if self.debug.dump_flow_tree {
-            fragment_tree.print();
-        }
-        if self.debug.dump_stacking_context_tree {
-            root_stacking_context.debug_print();
-        }
-        debug!("Layout done!");
-
-        if reflow_goal.needs_display() {
-            self.compositor_api.send_display_list(
-                self.webview_id,
-                display_list.compositor_info,
-                display_list.wr.end().1,
-            );
-
-            let (keys, instance_keys) = self
-                .font_context
-                .collect_unused_webrender_resources(false /* all */);
-            self.compositor_api
-                .remove_unused_font_resources(keys, instance_keys)
-        }
     }
 
     /// Returns profiling information which is passed to the time profiler.
@@ -935,51 +935,12 @@ impl LayoutThread {
         })
     }
 
-    /// Cancel animations for any nodes which have been removed from fragment tree.
-    /// TODO(mrobinson): We should look into a way of doing this during flow tree construction.
-    /// This also doesn't yet handles nodes that have been reparented.
-    fn cancel_animations_for_nodes_not_in_fragment_tree(
-        animations: &DocumentAnimationSet,
-        root: &FragmentTree,
-    ) {
-        // Assume all nodes have been removed until proven otherwise.
-        let mut animations = animations.sets.write();
-        let mut invalid_nodes = animations.keys().cloned().collect();
-        root.remove_nodes_in_fragment_tree_from_set(&mut invalid_nodes);
-
-        // Cancel animations for any nodes that are no longer in the fragment tree.
-        for node in &invalid_nodes {
-            if let Some(state) = animations.get_mut(node) {
-                state.cancel_all_animations();
-            }
-        }
-    }
-
-    fn cancel_image_animation_for_nodes_not_in_fragment_tree(
-        image_animation_set: Arc<RwLock<FxHashMap<OpaqueNode, ImageAnimationState>>>,
-        root: &FragmentTree,
-    ) {
-        let mut image_animations = image_animation_set.write().to_owned();
-        let mut invalid_nodes: FxHashSet<AnimationSetKey> = image_animations
-            .keys()
-            .cloned()
-            .map(|node| AnimationSetKey::new(node, None))
-            .collect();
-        root.remove_nodes_in_fragment_tree_from_set(&mut invalid_nodes);
-        for node in &invalid_nodes {
-            image_animations.remove(&node.node);
-        }
-    }
-
     fn viewport_did_change(&mut self, viewport_details: ViewportDetails) -> bool {
         let new_pixel_ratio = viewport_details.hidpi_scale_factor.get();
         let new_viewport_size = Size2D::new(
             Au::from_f32_px(viewport_details.size.width),
             Au::from_f32_px(viewport_details.size.height),
         );
-
-        // TODO: eliminate self.viewport_size in favour of using self.device.au_viewport_size()
-        self.viewport_size = new_viewport_size;
 
         let device = self.stylist.device();
         let size_did_change = device.au_viewport_size() != new_viewport_size;
@@ -1046,20 +1007,12 @@ fn get_ua_stylesheets() -> Result<UserAgentStylesheets, &'static str> {
     // FIXME: presentational-hints.css should be at author origin with zero specificity.
     //        (Does it make a difference?)
     let mut user_or_user_agent_stylesheets = vec![
-        parse_ua_stylesheet(
-            shared_lock,
-            "user-agent.css",
-            &resources::read_bytes(Resource::UserAgentCSS),
-        )?,
-        parse_ua_stylesheet(
-            shared_lock,
-            "servo.css",
-            &resources::read_bytes(Resource::ServoCSS),
-        )?,
+        parse_ua_stylesheet(shared_lock, "user-agent.css", USER_AGENT_CSS)?,
+        parse_ua_stylesheet(shared_lock, "servo.css", SERVO_CSS)?,
         parse_ua_stylesheet(
             shared_lock,
             "presentational-hints.css",
-            &resources::read_bytes(Resource::PresentationalHintsCSS),
+            PRESENTATIONAL_HINTS_CSS,
         )?,
     ];
 
@@ -1080,11 +1033,8 @@ fn get_ua_stylesheets() -> Result<UserAgentStylesheets, &'static str> {
         )));
     }
 
-    let quirks_mode_stylesheet = parse_ua_stylesheet(
-        shared_lock,
-        "quirks-mode.css",
-        &resources::read_bytes(Resource::QuirksModeCSS),
-    )?;
+    let quirks_mode_stylesheet =
+        parse_ua_stylesheet(shared_lock, "quirks-mode.css", QUIRKS_MODE_CSS)?;
 
     Ok(UserAgentStylesheets {
         shared_lock: shared_lock.clone(),
@@ -1160,8 +1110,7 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
         _vertical: bool,
         font: &Font,
         base_size: CSSPixelLength,
-        _in_media_query: bool,
-        _retrieve_math_scales: bool,
+        _flags: QueryFontMetricsFlags,
     ) -> FontMetrics {
         let font_context = &self.0;
         let font_group = self
@@ -1230,6 +1179,54 @@ impl Debug for LayoutFontMetricsProvider {
     }
 }
 
-thread_local!(static SEEN_POINTERS: LazyCell<RefCell<HashSet<*const c_void>>> = const {
-    LazyCell::new(|| RefCell::new(HashSet::new()))
-});
+struct SnapshotSetter<'dom> {
+    elements_with_snapshot: Vec<ServoLayoutElement<'dom>>,
+}
+
+impl SnapshotSetter<'_> {
+    fn new(reflow_request: &mut ReflowRequest, snapshot_map: &mut SnapshotMap) -> Self {
+        debug!(
+            "Draining restyles: {}",
+            reflow_request.pending_restyles.len()
+        );
+        let restyles = std::mem::take(&mut reflow_request.pending_restyles);
+
+        let elements_with_snapshot: Vec<_> = restyles
+            .iter()
+            .filter(|r| r.1.snapshot.is_some())
+            .map(|r| unsafe { ServoLayoutNode::new(&r.0).as_element().unwrap() })
+            .collect();
+
+        for (element, restyle) in restyles {
+            let element = unsafe { ServoLayoutNode::new(&element).as_element().unwrap() };
+
+            // If we haven't styled this node yet, we don't need to track a
+            // restyle.
+            let Some(mut style_data) = element.mutate_data() else {
+                unsafe { element.unset_snapshot_flags() };
+                continue;
+            };
+
+            debug!("Noting restyle for {:?}: {:?}", element, style_data);
+            if let Some(s) = restyle.snapshot {
+                unsafe { element.set_has_snapshot() };
+                snapshot_map.insert(element.as_node().opaque(), s);
+            }
+
+            // Stash the data on the element for processing by the style system.
+            style_data.hint.insert(restyle.hint);
+            style_data.damage = restyle.damage;
+        }
+        Self {
+            elements_with_snapshot,
+        }
+    }
+}
+
+impl Drop for SnapshotSetter<'_> {
+    fn drop(&mut self) {
+        for element in &self.elements_with_snapshot {
+            unsafe { element.unset_snapshot_flags() }
+        }
+    }
+}

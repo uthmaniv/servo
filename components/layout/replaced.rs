@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::LazyCell;
-use std::fmt;
 use std::sync::Arc;
 
 use app_units::Au;
@@ -14,10 +13,12 @@ use euclid::{Scale, Size2D};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{ImageOrMetadataAvailable, UsePlaceholder};
 use pixels::Image;
+use script::layout_dom::ServoLayoutNode;
 use script_layout_interface::IFrameSize;
 use servo_arc::Arc as ServoArc;
 use style::Zero;
 use style::computed_values::object_fit::T as ObjectFit;
+use style::dom::TNode;
 use style::logical_geometry::{Direction, WritingMode};
 use style::properties::ComputedValues;
 use style::servo::url::ComputedUrl;
@@ -96,33 +97,9 @@ impl NaturalSizes {
     }
 }
 
-#[derive(MallocSizeOf)]
-pub(crate) enum CanvasSource {
-    WebGL(ImageKey),
-    Image(ImageKey),
-    WebGPU(ImageKey),
-    /// transparent black
-    Empty,
-}
-
-impl fmt::Debug for CanvasSource {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match *self {
-                CanvasSource::WebGL(_) => "WebGL",
-                CanvasSource::Image(_) => "Image",
-                CanvasSource::WebGPU(_) => "WebGPU",
-                CanvasSource::Empty => "Empty",
-            }
-        )
-    }
-}
-
 #[derive(Debug, MallocSizeOf)]
 pub(crate) struct CanvasInfo {
-    pub source: CanvasSource,
+    pub source: Option<ImageKey>,
 }
 
 #[derive(Debug, MallocSizeOf)]
@@ -145,7 +122,7 @@ pub(crate) enum ReplacedContentKind {
 }
 
 impl ReplacedContents {
-    pub fn for_element<'dom>(element: impl NodeExt<'dom>, context: &LayoutContext) -> Option<Self> {
+    pub fn for_element(element: ServoLayoutNode<'_>, context: &LayoutContext) -> Option<Self> {
         if let Some(ref data_attribute_string) = element.as_typeless_object_with_data_attribute() {
             if let Some(url) = try_to_parse_image_data_url(data_attribute_string) {
                 return Self::from_image_url(
@@ -209,8 +186,8 @@ impl ReplacedContents {
         })
     }
 
-    pub fn from_image_url<'dom>(
-        element: impl NodeExt<'dom>,
+    pub fn from_image_url(
+        element: ServoLayoutNode<'_>,
         context: &LayoutContext,
         image_url: &ComputedUrl,
     ) -> Option<Self> {
@@ -220,13 +197,13 @@ impl ReplacedContents {
                 image_url.clone().into(),
                 UsePlaceholder::No,
             ) {
-                Some(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
+                Ok(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
                     (Some(image.clone()), image.width as f32, image.height as f32)
                 },
-                Some(ImageOrMetadataAvailable::MetadataAvailable(metadata, _id)) => {
+                Ok(ImageOrMetadataAvailable::MetadataAvailable(metadata, _id)) => {
                     (None, metadata.width as f32, metadata.height as f32)
                 },
-                None => return None,
+                Err(_) => return None,
             };
 
             return Some(Self {
@@ -238,8 +215,8 @@ impl ReplacedContents {
         None
     }
 
-    pub fn from_image<'dom>(
-        element: impl NodeExt<'dom>,
+    pub fn from_image(
+        element: ServoLayoutNode<'_>,
         context: &LayoutContext,
         image: &ComputedImage,
     ) -> Option<Self> {
@@ -388,12 +365,10 @@ impl ReplacedContents {
                     return vec![];
                 }
 
-                let image_key = match canvas_info.source {
-                    CanvasSource::WebGL(image_key) => image_key,
-                    CanvasSource::WebGPU(image_key) => image_key,
-                    CanvasSource::Image(image_key) => image_key,
-                    CanvasSource::Empty => return vec![],
+                let Some(image_key) = canvas_info.source else {
+                    return vec![];
                 };
+
                 vec![Fragment::Image(ArcRefCell::new(ImageFragment {
                     base: self.base_fragment_info.into(),
                     style: style.clone(),

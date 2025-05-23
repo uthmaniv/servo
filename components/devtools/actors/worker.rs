@@ -17,6 +17,7 @@ use servo_url::ServoUrl;
 use crate::StreamId;
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
 use crate::protocol::JsonPacketStream;
+use crate::resource::ResourceAvailable;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -47,9 +48,17 @@ impl WorkerActor {
             url: self.url.to_string(),
             traits: WorkerTraits {
                 is_parent_intercept_enabled: false,
+                supports_top_level_target_flag: false,
             },
             type_: self.type_ as u32,
+            target_type: "worker".to_string(),
         }
+    }
+}
+
+impl ResourceAvailable for WorkerActor {
+    fn actor_name(&self) -> String {
+        self.name.clone()
     }
 }
 
@@ -149,6 +158,7 @@ struct ConnectReply {
 #[serde(rename_all = "camelCase")]
 struct WorkerTraits {
     is_parent_intercept_enabled: bool,
+    supports_top_level_target_flag: bool,
 }
 
 #[derive(Serialize)]
@@ -162,4 +172,6 @@ pub(crate) struct WorkerMsg {
     traits: WorkerTraits,
     #[serde(rename = "type")]
     type_: u32,
+    #[serde(rename = "targetType")]
+    target_type: String,
 }

@@ -4,7 +4,9 @@
 
 use geom::{FlexAxis, MainStartCrossStart};
 use malloc_size_of_derive::MallocSizeOf;
+use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
+use style::context::SharedStyleContext;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style::properties::longhands::align_items::computed_value::T as AlignItems;
@@ -17,7 +19,7 @@ use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
 use crate::context::LayoutContext;
-use crate::dom::{LayoutBox, NodeExt};
+use crate::dom::LayoutBox;
 use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::{BaseFragmentInfo, Fragment};
@@ -90,7 +92,6 @@ impl FlexContainerConfig {
 pub(crate) struct FlexContainer {
     children: Vec<ArcRefCell<FlexLevelBox>>,
 
-    #[conditional_malloc_size_of]
     style: ServoArc<ComputedValues>,
 
     /// The configuration of this [`FlexContainer`].
@@ -98,14 +99,13 @@ pub(crate) struct FlexContainer {
 }
 
 impl FlexContainer {
-    pub fn construct<'dom>(
+    pub fn construct(
         context: &LayoutContext,
-        info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        info: &NodeAndStyleInfo<'_>,
         contents: NonReplacedContents,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
-        let mut builder =
-            ModernContainerBuilder::new(context, info, propagated_data.union(&info.style));
+        let mut builder = ModernContainerBuilder::new(context, info, propagated_data);
         contents.traverse(context, info, &mut builder);
         let items = builder.finish();
 
@@ -137,6 +137,11 @@ impl FlexContainer {
             config: FlexContainerConfig::new(&info.style),
         }
     }
+
+    pub(crate) fn repair_style(&mut self, new_style: &ServoArc<ComputedValues>) {
+        self.config = FlexContainerConfig::new(new_style);
+        self.style = new_style.clone();
+    }
 }
 
 #[derive(Debug, MallocSizeOf)]
@@ -146,6 +151,23 @@ pub(crate) enum FlexLevelBox {
 }
 
 impl FlexLevelBox {
+    pub(crate) fn repair_style(
+        &mut self,
+        context: &SharedStyleContext,
+        node: &ServoLayoutNode,
+        new_style: &ServoArc<ComputedValues>,
+    ) {
+        match self {
+            FlexLevelBox::FlexItem(flex_item_box) => flex_item_box
+                .independent_formatting_context
+                .repair_style(context, node, new_style),
+            FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
+                .borrow_mut()
+                .context
+                .repair_style(context, node, new_style),
+        }
+    }
+
     pub(crate) fn invalidate_cached_fragment(&self) {
         match self {
             FlexLevelBox::FlexItem(flex_item_box) => flex_item_box

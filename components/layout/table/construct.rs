@@ -8,7 +8,7 @@ use std::iter::repeat;
 
 use atomic_refcell::AtomicRef;
 use log::warn;
-use script_layout_interface::wrapper_traits::ThreadSafeLayoutNode;
+use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
 use servo_arc::Arc;
 use style::properties::ComputedValues;
 use style::properties::style_structs::Font;
@@ -19,10 +19,9 @@ use super::{
     Table, TableCaption, TableLevelBox, TableSlot, TableSlotCell, TableSlotCoordinates,
     TableSlotOffset, TableTrack, TableTrackGroup, TableTrackGroupType,
 };
-use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
-use crate::dom::{BoxSlot, LayoutBox, NodeExt};
+use crate::dom::{BoxSlot, LayoutBox};
 use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents, TraversalHandler};
 use crate::flow::{BlockContainerBuilder, BlockFormattingContext};
 use crate::formatting_contexts::{
@@ -32,6 +31,7 @@ use crate::formatting_contexts::{
 use crate::fragment_tree::BaseFragmentInfo;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::style_ext::{DisplayGeneratingBox, DisplayLayoutInternal};
+use crate::{PropagatedBoxTreeData, SharedStyle};
 
 /// A reference to a slot and its coordinates in the table
 #[derive(Debug)]
@@ -50,17 +50,17 @@ impl ResolvedSlotAndLocation<'_> {
     }
 }
 
-pub(crate) enum AnonymousTableContent<'dom, Node> {
-    Text(NodeAndStyleInfo<Node>, Cow<'dom, str>),
+pub(crate) enum AnonymousTableContent<'dom> {
+    Text(NodeAndStyleInfo<'dom>, Cow<'dom, str>),
     Element {
-        info: NodeAndStyleInfo<Node>,
+        info: NodeAndStyleInfo<'dom>,
         display: DisplayGeneratingBox,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
     },
 }
 
-impl<Node> AnonymousTableContent<'_, Node> {
+impl AnonymousTableContent<'_> {
     fn is_whitespace_only(&self) -> bool {
         match self {
             Self::Element { .. } => false,
@@ -74,32 +74,24 @@ impl<Node> AnonymousTableContent<'_, Node> {
 }
 
 impl Table {
-    pub(crate) fn construct<'dom>(
+    pub(crate) fn construct(
         context: &LayoutContext,
-        info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        info: &NodeAndStyleInfo,
         grid_style: Arc<ComputedValues>,
         contents: NonReplacedContents,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
-        let mut traversal = TableBuilderTraversal::new(
-            context,
-            info,
-            grid_style,
-            propagated_data.union(&info.style),
-        );
+        let mut traversal = TableBuilderTraversal::new(context, info, grid_style, propagated_data);
         contents.traverse(context, info, &mut traversal);
         traversal.finish()
     }
 
-    pub(crate) fn construct_anonymous<'dom, Node>(
+    pub(crate) fn construct_anonymous<'dom>(
         context: &LayoutContext,
-        parent_info: &NodeAndStyleInfo<Node>,
-        contents: Vec<AnonymousTableContent<'dom, Node>>,
+        parent_info: &NodeAndStyleInfo<'dom>,
+        contents: Vec<AnonymousTableContent<'dom>>,
         propagated_data: PropagatedBoxTreeData,
-    ) -> (NodeAndStyleInfo<Node>, IndependentFormattingContext)
-    where
-        Node: crate::dom::NodeExt<'dom>,
-    {
+    ) -> (NodeAndStyleInfo<'dom>, IndependentFormattingContext) {
         let table_info = parent_info
             .pseudo(context, PseudoElement::ServoAnonymousTable)
             .expect("Should never fail to create anonymous table info.");
@@ -645,9 +637,9 @@ impl TableBuilder {
     }
 }
 
-pub(crate) struct TableBuilderTraversal<'style, 'dom, Node> {
+pub(crate) struct TableBuilderTraversal<'style, 'dom> {
     context: &'style LayoutContext<'style>,
-    info: &'style NodeAndStyleInfo<Node>,
+    info: &'style NodeAndStyleInfo<'dom>,
 
     /// The value of the [`PropagatedBoxTreeData`] to use, either for the row group
     /// if processing one or for the table itself if outside a row group.
@@ -657,19 +649,16 @@ pub(crate) struct TableBuilderTraversal<'style, 'dom, Node> {
     /// into another struct so that we can write unit tests against the builder.
     builder: TableBuilder,
 
-    current_anonymous_row_content: Vec<AnonymousTableContent<'dom, Node>>,
+    current_anonymous_row_content: Vec<AnonymousTableContent<'dom>>,
 
     /// The index of the current row group, if there is one.
     current_row_group_index: Option<usize>,
 }
 
-impl<'style, 'dom, Node> TableBuilderTraversal<'style, 'dom, Node>
-where
-    Node: NodeExt<'dom>,
-{
+impl<'style, 'dom> TableBuilderTraversal<'style, 'dom> {
     pub(crate) fn new(
         context: &'style LayoutContext<'style>,
-        info: &'style NodeAndStyleInfo<Node>,
+        info: &'style NodeAndStyleInfo<'dom>,
         grid_style: Arc<ComputedValues>,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
@@ -728,9 +717,10 @@ where
 
         let style = anonymous_info.style.clone();
         self.push_table_row(ArcRefCell::new(TableTrack {
-            base: LayoutBoxBase::new((&anonymous_info).into(), style),
+            base: LayoutBoxBase::new((&anonymous_info).into(), style.clone()),
             group_index: self.current_row_group_index,
             is_anonymous: true,
+            shared_background_style: SharedStyle::new(style),
         }));
     }
 
@@ -745,11 +735,8 @@ where
     }
 }
 
-impl<'dom, Node: 'dom> TraversalHandler<'dom, Node> for TableBuilderTraversal<'_, 'dom, Node>
-where
-    Node: NodeExt<'dom>,
-{
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<Node>, text: Cow<'dom, str>) {
+impl<'dom> TraversalHandler<'dom> for TableBuilderTraversal<'_, 'dom> {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>) {
         self.current_anonymous_row_content
             .push(AnonymousTableContent::Text(info.clone(), text));
     }
@@ -757,7 +744,7 @@ where
     /// <https://html.spec.whatwg.org/multipage/#forming-a-table>
     fn handle_element(
         &mut self,
-        info: &NodeAndStyleInfo<Node>,
+        info: &NodeAndStyleInfo<'dom>,
         display: DisplayGeneratingBox,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -775,11 +762,9 @@ where
                         base: LayoutBoxBase::new(info.into(), info.style.clone()),
                         group_type: internal.into(),
                         track_range: next_row_index..next_row_index,
+                        shared_background_style: SharedStyle::new(info.style.clone()),
                     });
                     self.builder.table.row_groups.push(row_group.clone());
-
-                    let previous_propagated_data = self.current_propagated_data;
-                    self.current_propagated_data = self.current_propagated_data.union(&info.style);
 
                     let new_row_group_index = self.builder.table.row_groups.len() - 1;
                     self.current_row_group_index = Some(new_row_group_index);
@@ -792,7 +777,6 @@ where
                     self.finish_anonymous_row_if_needed();
 
                     self.current_row_group_index = None;
-                    self.current_propagated_data = previous_propagated_data;
                     self.builder.incoming_rowspans.clear();
 
                     box_slot.set(LayoutBox::TableLevelBox(TableLevelBox::TrackGroup(
@@ -817,6 +801,7 @@ where
                         base: LayoutBoxBase::new(info.into(), info.style.clone()),
                         group_index: self.current_row_group_index,
                         is_anonymous: false,
+                        shared_background_style: SharedStyle::new(info.style.clone()),
                     });
                     self.push_table_row(row.clone());
                     box_slot.set(LayoutBox::TableLevelBox(TableLevelBox::Track(row)));
@@ -862,6 +847,7 @@ where
                         base: LayoutBoxBase::new(info.into(), info.style.clone()),
                         group_type: internal.into(),
                         track_range: first_column..self.builder.table.columns.len(),
+                        shared_background_style: SharedStyle::new(info.style.clone()),
                     });
                     self.builder.table.column_groups.push(column_group.clone());
                     box_slot.set(LayoutBox::TableLevelBox(TableLevelBox::TrackGroup(
@@ -916,26 +902,23 @@ where
     }
 }
 
-struct TableRowBuilder<'style, 'builder, 'dom, 'a, Node> {
-    table_traversal: &'builder mut TableBuilderTraversal<'style, 'dom, Node>,
+struct TableRowBuilder<'style, 'builder, 'dom, 'a> {
+    table_traversal: &'builder mut TableBuilderTraversal<'style, 'dom>,
 
     /// The [`NodeAndStyleInfo`] of this table row, which we use to
     /// construct anonymous table cells.
-    info: &'a NodeAndStyleInfo<Node>,
+    info: &'a NodeAndStyleInfo<'dom>,
 
-    current_anonymous_cell_content: Vec<AnonymousTableContent<'dom, Node>>,
+    current_anonymous_cell_content: Vec<AnonymousTableContent<'dom>>,
 
     /// The [`PropagatedBoxTreeData`] to use for all children of this row.
     propagated_data: PropagatedBoxTreeData,
 }
 
-impl<'style, 'builder, 'dom, 'a, Node: 'dom> TableRowBuilder<'style, 'builder, 'dom, 'a, Node>
-where
-    Node: NodeExt<'dom>,
-{
+impl<'style, 'builder, 'dom, 'a> TableRowBuilder<'style, 'builder, 'dom, 'a> {
     fn new(
-        table_traversal: &'builder mut TableBuilderTraversal<'style, 'dom, Node>,
-        info: &'a NodeAndStyleInfo<Node>,
+        table_traversal: &'builder mut TableBuilderTraversal<'style, 'dom>,
+        info: &'a NodeAndStyleInfo<'dom>,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
         table_traversal.builder.start_row();
@@ -944,7 +927,7 @@ where
             table_traversal,
             info,
             current_anonymous_cell_content: Vec::new(),
-            propagated_data: propagated_data.union(&info.style),
+            propagated_data,
         }
     }
 
@@ -996,11 +979,8 @@ where
     }
 }
 
-impl<'dom, Node: 'dom> TraversalHandler<'dom, Node> for TableRowBuilder<'_, '_, 'dom, '_, Node>
-where
-    Node: NodeExt<'dom>,
-{
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<Node>, text: Cow<'dom, str>) {
+impl<'dom> TraversalHandler<'dom> for TableRowBuilder<'_, '_, 'dom, '_> {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>) {
         self.current_anonymous_cell_content
             .push(AnonymousTableContent::Text(info.clone(), text));
     }
@@ -1008,7 +988,7 @@ where
     /// <https://html.spec.whatwg.org/multipage/#algorithm-for-processing-rows>
     fn handle_element(
         &mut self,
-        info: &NodeAndStyleInfo<Node>,
+        info: &NodeAndStyleInfo<'dom>,
         display: DisplayGeneratingBox,
         contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -1019,15 +999,16 @@ where
                 DisplayLayoutInternal::TableCell => {
                     // This value will already have filtered out rowspan=0
                     // in quirks mode, so we don't have to worry about that.
-                    //
-                    // The HTML specification limits the parsed value of `rowspan` to
-                    // 65534 and `colspan` to 1000, so we also enforce the same limits
-                    // when dealing with arbitrary DOM elements (perhaps created via
-                    // script).
                     let (rowspan, colspan) = if info.pseudo_element_type.is_none() {
                         let node = info.node.to_threadsafe();
-                        let rowspan = node.get_rowspan().unwrap_or(1).min(65534) as usize;
-                        let colspan = node.get_colspan().unwrap_or(1).min(1000) as usize;
+                        let rowspan = node.get_rowspan().unwrap_or(1) as usize;
+                        let colspan = node.get_colspan().unwrap_or(1) as usize;
+
+                        // The HTML specification clamps value of `rowspan` to [0, 65534] and
+                        // `colspan` to [1, 1000].
+                        assert!((1..=1000).contains(&colspan));
+                        assert!((0..=65534).contains(&rowspan));
+
                         (rowspan, colspan)
                     } else {
                         (1, 1)
@@ -1090,14 +1071,11 @@ struct TableColumnGroupBuilder {
     columns: Vec<ArcRefCell<TableTrack>>,
 }
 
-impl<'dom, Node: 'dom> TraversalHandler<'dom, Node> for TableColumnGroupBuilder
-where
-    Node: NodeExt<'dom>,
-{
-    fn handle_text(&mut self, _info: &NodeAndStyleInfo<Node>, _text: Cow<'dom, str>) {}
+impl<'dom> TraversalHandler<'dom> for TableColumnGroupBuilder {
+    fn handle_text(&mut self, _info: &NodeAndStyleInfo<'dom>, _text: Cow<'dom, str>) {}
     fn handle_element(
         &mut self,
-        info: &NodeAndStyleInfo<Node>,
+        info: &NodeAndStyleInfo<'dom>,
         display: DisplayGeneratingBox,
         _contents: Contents,
         box_slot: BoxSlot<'dom>,
@@ -1133,28 +1111,27 @@ impl From<DisplayLayoutInternal> for TableTrackGroupType {
     }
 }
 
-fn add_column<'dom, Node: NodeExt<'dom>>(
+fn add_column(
     collection: &mut Vec<ArcRefCell<TableTrack>>,
-    column_info: &NodeAndStyleInfo<Node>,
+    column_info: &NodeAndStyleInfo,
     group_index: Option<usize>,
     is_anonymous: bool,
 ) -> ArcRefCell<TableTrack> {
     let span = if column_info.pseudo_element_type.is_none() {
-        column_info
-            .node
-            .to_threadsafe()
-            .get_span()
-            .unwrap_or(1)
-            .min(1000) as usize
+        column_info.node.to_threadsafe().get_span().unwrap_or(1)
     } else {
         1
     };
+
+    // The HTML specification clamps value of `span` for `<col>` to [1, 1000].
+    assert!((1..=1000).contains(&span));
 
     let column = ArcRefCell::new(TableTrack {
         base: LayoutBoxBase::new(column_info.into(), column_info.style.clone()),
         group_index,
         is_anonymous,
+        shared_background_style: SharedStyle::new(column_info.style.clone()),
     });
-    collection.extend(repeat(column.clone()).take(span));
+    collection.extend(repeat(column.clone()).take(span as usize));
     column
 }

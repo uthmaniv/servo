@@ -27,8 +27,8 @@
   [CrossOriginCallable] undefined close();
   [CrossOriginReadable] readonly attribute boolean closed;
   undefined stop();
-  //[CrossOriginCallable] void focus();
-  //[CrossOriginCallable] void blur();
+  [CrossOriginCallable] undefined focus();
+  [CrossOriginCallable] undefined blur();
 
   // other browsing contexts
   [Replaceable, CrossOriginReadable] readonly attribute WindowProxy frames;
@@ -148,7 +148,12 @@ partial interface Window {
 partial interface Window {
   // Shouldn't be public, but just to make things work for now
   undefined webdriverCallback(optional any result);
+  undefined webdriverException(optional any result);
   undefined webdriverTimeout();
+  Element? webdriverElement(DOMString id);
+  Element? webdriverFrame(DOMString id);
+  Window? webdriverWindow(DOMString id);
+  ShadowRoot? webdriverShadowRoot(DOMString id);
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-sessionstorage

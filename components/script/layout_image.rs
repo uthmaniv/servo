@@ -81,7 +81,7 @@ impl FetchResponseListener for LayoutImageContext {
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations);
+        global.report_csp_violations(violations, None);
     }
 }
 
@@ -119,7 +119,10 @@ pub(crate) fn fetch_image_for_layout(
     )
     .origin(document.origin().immutable().clone())
     .destination(Destination::Image)
-    .pipeline_id(Some(document.global().pipeline_id()));
+    .pipeline_id(Some(document.global().pipeline_id()))
+    .insecure_requests_policy(document.insecure_requests_policy())
+    .has_trustworthy_ancestor_origin(document.has_trustworthy_ancestor_origin())
+    .policy_container(document.policy_container().to_owned());
 
     // Layout image loads do not delay the document load event.
     document.fetch_background(request, context);

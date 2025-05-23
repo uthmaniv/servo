@@ -20,15 +20,15 @@ use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
-    AnimationTickType, LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
+    LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
     StructuredSerializedData, WindowSizeType,
 };
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    CompositorHitTestResult, InputEvent, MediaSessionActionType, Theme, ViewportDetails,
-    WebDriverScriptCommand,
+    CompositorHitTestResult, FocusSequenceNumber, InputEvent, JavaScriptEvaluationId,
+    MediaSessionActionType, Theme, ViewportDetails, WebDriverScriptCommand,
 };
 use euclid::{Rect, Scale, Size2D, UnknownUnit};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
@@ -191,11 +191,19 @@ pub enum ScriptThreadMessage {
     RemoveHistoryStates(PipelineId, Vec<HistoryStateId>),
     /// Set an iframe to be focused. Used when an element in an iframe gains focus.
     /// PipelineId is for the parent, BrowsingContextId is for the nested browsing context
-    FocusIFrame(PipelineId, BrowsingContextId),
+    FocusIFrame(PipelineId, BrowsingContextId, FocusSequenceNumber),
+    /// Focus the document. Used when the container gains focus.
+    FocusDocument(PipelineId, FocusSequenceNumber),
+    /// Notifies that the document's container (e.g., an iframe) is not included
+    /// in the top-level browsing context's focus chain (not considering system
+    /// focus) anymore.
+    ///
+    /// Obviously, this message is invalid for a top-level document.
+    Unfocus(PipelineId, FocusSequenceNumber),
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(PipelineId, AnimationTickType),
+    TickAllAnimations(Vec<WebViewId>),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId, bool /* success */),
@@ -237,6 +245,9 @@ pub enum ScriptThreadMessage {
     /// The compositor scrolled and is updating the scroll states of the nodes in the given
     /// pipeline via the Constellation.
     SetScrollStates(PipelineId, Vec<ScrollState>),
+    /// Evaluate the given JavaScript and return a result via a corresponding message
+    /// to the Constellation.
+    EvaluateJavaScript(PipelineId, JavaScriptEvaluationId, String),
 }
 
 impl fmt::Debug for ScriptThreadMessage {

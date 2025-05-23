@@ -10,10 +10,12 @@ use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::Sender;
 use embedder_traits::{
     AnimationState, EventLoopWaker, MouseButton, MouseButtonAction, TouchEventResult,
+    WebDriverMessageId,
 };
 use euclid::Rect;
 use ipc_channel::ipc::IpcSender;
 use log::warn;
+use malloc_size_of_derive::MallocSizeOf;
 use pixels::Image;
 use strum_macros::IntoStaticStr;
 use style_traits::CSSPixel;
@@ -100,9 +102,18 @@ pub enum CompositorMsg {
     /// The load of a page has completed
     LoadComplete(WebViewId),
     /// WebDriver mouse button event
-    WebDriverMouseButtonEvent(WebViewId, MouseButtonAction, MouseButton, f32, f32),
+    WebDriverMouseButtonEvent(
+        WebViewId,
+        MouseButtonAction,
+        MouseButton,
+        f32,
+        f32,
+        WebDriverMessageId,
+    ),
     /// WebDriver mouse move event
-    WebDriverMouseMoveEvent(WebViewId, f32, f32),
+    WebDriverMouseMoveEvent(WebViewId, f32, f32, WebDriverMessageId),
+    // Webdriver wheel scroll event
+    WebDriverWheelScrollEvent(WebViewId, f32, f32, f64, f64),
 
     /// Inform WebRender of the existence of this pipeline.
     SendInitialTransaction(WebRenderPipelineId),
@@ -188,7 +199,7 @@ pub struct CompositionPipeline {
 }
 
 /// A mechanism to send messages from ScriptThread to the parent process' WebRender instance.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
 pub struct CrossProcessCompositorApi(pub IpcSender<CompositorMsg>);
 
 impl CrossProcessCompositorApi {
@@ -233,7 +244,7 @@ impl CrossProcessCompositorApi {
     pub fn send_display_list(
         &self,
         webview_id: WebViewId,
-        display_list_info: CompositorDisplayListInfo,
+        display_list_info: &CompositorDisplayListInfo,
         list: BuiltDisplayList,
     ) {
         let (display_list_data, display_list_descriptor) = list.into_data();

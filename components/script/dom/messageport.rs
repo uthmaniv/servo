@@ -23,7 +23,7 @@ use crate::dom::bindings::error::{Error, ErrorResult, ErrorToJsval};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::structuredclone::{self, StructuredData, StructuredDataReader};
+use crate::dom::bindings::structuredclone::{self, StructuredData};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::bindings::utils::set_dictionary_property;
@@ -81,6 +81,20 @@ impl MessagePort {
     /// <https://html.spec.whatwg.org/multipage/#entangle>
     pub(crate) fn entangle(&self, other_id: MessagePortId) {
         *self.entangled_port.borrow_mut() = Some(other_id);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    pub(crate) fn disentangle(&self) -> Option<MessagePortId> {
+        // Disentangle initiatorPort and otherPort, so that they are no longer entangled or associated with each other.
+        // Note: called from `disentangle_port` in the global, where the rest happens.
+        self.entangled_port.borrow_mut().take()
+    }
+
+    /// Has the port been disentangled?
+    /// Used when starting the port to fire the `close` event,
+    /// to cover the case of a disentanglement while in transfer.
+    pub(crate) fn disentangled(&self) -> bool {
+        self.entangled_port.borrow().is_none()
     }
 
     pub(crate) fn message_port_id(&self) -> &MessagePortId {
@@ -268,17 +282,13 @@ impl Transferable for MessagePort {
         Ok(transferred_port)
     }
 
-    fn serialized_storage(
-        data: StructuredData<'_>,
-    ) -> &mut Option<HashMap<MessagePortId, Self::Data>> {
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,
         }
-    }
-
-    fn deserialized_storage(reader: &mut StructuredDataReader) -> &mut Option<Vec<DomRoot<Self>>> {
-        &mut reader.message_ports
     }
 }
 
@@ -318,20 +328,24 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-start>
-    fn Start(&self) {
+    fn Start(&self, can_gc: CanGc) {
         if self.detached.get() {
             return;
         }
-        self.global().start_message_port(self.message_port_id());
+        self.global()
+            .start_message_port(self.message_port_id(), can_gc);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-close>
-    fn Close(&self) {
-        if self.detached.get() {
-            return;
-        }
+    fn Close(&self, can_gc: CanGc) {
+        // Set this's [[Detached]] internal slot value to true.
         self.detached.set(true);
-        self.global().close_message_port(self.message_port_id());
+
+        let global = self.global();
+        global.close_message_port(self.message_port_id());
+
+        // If this is entangled, disentangle it.
+        global.disentangle_port(self, can_gc);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
@@ -344,15 +358,19 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn SetOnmessage(&self, listener: Option<Rc<EventHandlerNonNull>>) {
+    fn SetOnmessage(&self, listener: Option<Rc<EventHandlerNonNull>>, can_gc: CanGc) {
         if self.detached.get() {
             return;
         }
         self.set_onmessage(listener);
         // Note: we cannot use the event_handler macro, due to the need to start the port.
-        self.global().start_message_port(self.message_port_id());
+        self.global()
+            .start_message_port(self.message_port_id(), can_gc);
     }
 
     // <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessageerror>
     event_handler!(messageerror, GetOnmessageerror, SetOnmessageerror);
+
+    // <https://html.spec.whatwg.org/multipage/#handler-messageport-onclose>
+    event_handler!(close, GetOnclose, SetOnclose);
 }

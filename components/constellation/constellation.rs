@@ -112,11 +112,11 @@ use compositing_traits::{
     CompositorMsg, CompositorProxy, SendableFrameTree, WebrenderExternalImageRegistry,
 };
 use constellation_traits::{
-    AnimationTickType, AuxiliaryWebViewCreationRequest, AuxiliaryWebViewCreationResponse,
-    BroadcastMsg, DocumentState, EmbedderToConstellationMessage, IFrameLoadInfo,
-    IFrameLoadInfoWithData, IFrameSandboxState, IFrameSizeMsg, Job, LoadData, LoadOrigin, LogEntry,
-    MessagePortMsg, NavigationHistoryBehavior, PaintMetricEvent, PortMessageTask, SWManagerMsg,
-    SWManagerSenders, ScriptToConstellationChan, ScriptToConstellationMessage, ScrollState,
+    AuxiliaryWebViewCreationRequest, AuxiliaryWebViewCreationResponse, BroadcastMsg, DocumentState,
+    EmbedderToConstellationMessage, IFrameLoadInfo, IFrameLoadInfoWithData, IFrameSandboxState,
+    IFrameSizeMsg, Job, LoadData, LoadOrigin, LogEntry, MessagePortMsg, NavigationHistoryBehavior,
+    PaintMetricEvent, PortMessageTask, PortTransferInfo, SWManagerMsg, SWManagerSenders,
+    ScriptToConstellationChan, ScriptToConstellationMessage, ScrollState,
     ServiceWorkerManagerFactory, ServiceWorkerMsg, StructuredSerializedData, TraversalDirection,
     WindowSizeType,
 };
@@ -128,10 +128,11 @@ use devtools_traits::{
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    AnimationState, CompositorHitTestResult, Cursor, EmbedderMsg, EmbedderProxy, ImeEvent,
-    InputEvent, MediaSessionActionType, MediaSessionEvent, MediaSessionPlaybackState, MouseButton,
-    MouseButtonAction, MouseButtonEvent, Theme, ViewportDetails, WebDriverCommandMsg,
-    WebDriverLoadStatus,
+    AnimationState, CompositorHitTestResult, Cursor, EmbedderMsg, EmbedderProxy,
+    FocusSequenceNumber, ImeEvent, InputEvent, JSValue, JavaScriptEvaluationError,
+    JavaScriptEvaluationId, MediaSessionActionType, MediaSessionEvent, MediaSessionPlaybackState,
+    MouseButton, MouseButtonAction, MouseButtonEvent, Theme, ViewportDetails, WebDriverCommandMsg,
+    WebDriverCommandResponse, WebDriverLoadStatus,
 };
 use euclid::Size2D;
 use euclid::default::Size2D as UntypedSize2D;
@@ -203,9 +204,6 @@ enum TransferState {
     /// While a completion failed, another global requested to complete the transfer.
     /// We are still buffering messages, and awaiting the return of the buffer from the global who failed.
     CompletionRequested(MessagePortRouterId, VecDeque<PortMessageTask>),
-    /// The entangled port has been removed while the port was in-transfer,
-    /// the current port should be removed as well once it is managed again.
-    EntangledRemoved,
 }
 
 #[derive(Debug)]
@@ -374,6 +372,7 @@ pub struct Constellation<STF, SWF> {
     mem_profiler_chan: mem::ProfilerChan,
 
     /// A single WebRender document the constellation operates on.
+    #[cfg(feature = "webgpu")]
     webrender_document: DocumentId,
 
     /// Webrender related objects required by WebGPU threads
@@ -533,6 +532,8 @@ pub struct InitialConstellationState {
 struct WebDriverData {
     load_channel: Option<(PipelineId, IpcSender<WebDriverLoadStatus>)>,
     resize_channel: Option<IpcSender<Size2D<f32, CSSPixel>>>,
+    // Forward responses from the script thread to the webdriver server.
+    input_command_response_sender: Option<IpcSender<WebDriverCommandResponse>>,
 }
 
 impl WebDriverData {
@@ -540,6 +541,7 @@ impl WebDriverData {
         WebDriverData {
             load_channel: None,
             resize_channel: None,
+            input_command_response_sender: None,
         }
     }
 }
@@ -718,6 +720,7 @@ where
                     phantom: PhantomData,
                     webdriver: WebDriverData::new(),
                     document_states: HashMap::new(),
+                    #[cfg(feature = "webgpu")]
                     webrender_document: state.webrender_document,
                     #[cfg(feature = "webgpu")]
                     webrender_wgpu,
@@ -1042,6 +1045,44 @@ where
             pipelines: &self.pipelines,
             browsing_contexts: &self.browsing_contexts,
         }
+    }
+
+    /// Enumerate the specified browsing context's ancestor pipelines up to
+    /// the top-level pipeline.
+    fn ancestor_pipelines_of_browsing_context_iter(
+        &self,
+        browsing_context_id: BrowsingContextId,
+    ) -> impl Iterator<Item = &Pipeline> + '_ {
+        let mut state: Option<PipelineId> = self
+            .browsing_contexts
+            .get(&browsing_context_id)
+            .and_then(|browsing_context| browsing_context.parent_pipeline_id);
+        std::iter::from_fn(move || {
+            if let Some(pipeline_id) = state {
+                let pipeline = self.pipelines.get(&pipeline_id)?;
+                let browsing_context = self.browsing_contexts.get(&pipeline.browsing_context_id)?;
+                state = browsing_context.parent_pipeline_id;
+                Some(pipeline)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Enumerate the specified browsing context's ancestor-or-self pipelines up
+    /// to the top-level pipeline.
+    fn ancestor_or_self_pipelines_of_browsing_context_iter(
+        &self,
+        browsing_context_id: BrowsingContextId,
+    ) -> impl Iterator<Item = &Pipeline> + '_ {
+        let this_pipeline = self
+            .browsing_contexts
+            .get(&browsing_context_id)
+            .map(|browsing_context| browsing_context.pipeline_id)
+            .and_then(|pipeline_id| self.pipelines.get(&pipeline_id));
+        this_pipeline
+            .into_iter()
+            .chain(self.ancestor_pipelines_of_browsing_context_iter(browsing_context_id))
     }
 
     /// Create a new browsing context and update the internal bookkeeping.
@@ -1398,8 +1439,8 @@ where
             EmbedderToConstellationMessage::ThemeChange(theme) => {
                 self.handle_theme_change(theme);
             },
-            EmbedderToConstellationMessage::TickAnimation(pipeline_id, tick_type) => {
-                self.handle_tick_animation(pipeline_id, tick_type)
+            EmbedderToConstellationMessage::TickAnimation(webview_ids) => {
+                self.handle_tick_animation(webview_ids)
             },
             EmbedderToConstellationMessage::WebDriverCommand(command) => {
                 self.handle_webdriver_msg(command);
@@ -1440,6 +1481,52 @@ where
             EmbedderToConstellationMessage::PaintMetric(pipeline_id, paint_metric_event) => {
                 self.handle_paint_metric(pipeline_id, paint_metric_event);
             },
+            EmbedderToConstellationMessage::EvaluateJavaScript(
+                webview_id,
+                evaluation_id,
+                script,
+            ) => {
+                self.handle_evaluate_javascript(webview_id, evaluation_id, script);
+            },
+        }
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
+    fn handle_evaluate_javascript(
+        &mut self,
+        webview_id: WebViewId,
+        evaluation_id: JavaScriptEvaluationId,
+        script: String,
+    ) {
+        let browsing_context_id = BrowsingContextId::from(webview_id);
+        let Some(pipeline) = self
+            .browsing_contexts
+            .get(&browsing_context_id)
+            .and_then(|browsing_context| self.pipelines.get(&browsing_context.pipeline_id))
+        else {
+            self.handle_finish_javascript_evaluation(
+                evaluation_id,
+                Err(JavaScriptEvaluationError::InternalError),
+            );
+            return;
+        };
+
+        if pipeline
+            .event_loop
+            .send(ScriptThreadMessage::EvaluateJavaScript(
+                pipeline.id,
+                evaluation_id,
+                script,
+            ))
+            .is_err()
+        {
+            self.handle_finish_javascript_evaluation(
+                evaluation_id,
+                Err(JavaScriptEvaluationError::InternalError),
+            );
         }
     }
 
@@ -1487,11 +1574,11 @@ where
             ScriptToConstellationMessage::NewMessagePort(router_id, port_id) => {
                 self.handle_new_messageport(router_id, port_id);
             },
-            ScriptToConstellationMessage::RemoveMessagePort(port_id) => {
-                self.handle_remove_messageport(port_id);
-            },
             ScriptToConstellationMessage::EntanglePorts(port1, port2) => {
                 self.handle_entangle_messageports(port1, port2);
+            },
+            ScriptToConstellationMessage::DisentanglePorts(port1, port2) => {
+                self.handle_disentangle_messageports(port1, port2);
             },
             ScriptToConstellationMessage::NewBroadcastChannelRouter(
                 router_id,
@@ -1622,8 +1709,15 @@ where
                     data,
                 );
             },
-            ScriptToConstellationMessage::Focus => {
-                self.handle_focus_msg(source_pipeline_id);
+            ScriptToConstellationMessage::Focus(focused_child_browsing_context_id, sequence) => {
+                self.handle_focus_msg(
+                    source_pipeline_id,
+                    focused_child_browsing_context_id,
+                    sequence,
+                );
+            },
+            ScriptToConstellationMessage::FocusRemoteDocument(focused_browsing_context_id) => {
+                self.handle_focus_remote_document_msg(focused_browsing_context_id);
             },
             ScriptToConstellationMessage::SetThrottledComplete(throttled) => {
                 self.handle_set_throttled_complete(source_pipeline_id, throttled);
@@ -1772,6 +1866,21 @@ where
                 // get memory report and send it back.
                 self.mem_profiler_chan
                     .send(mem::ProfilerMsg::Report(sender));
+            },
+            ScriptToConstellationMessage::FinishJavaScriptEvaluation(evaluation_id, result) => {
+                self.handle_finish_javascript_evaluation(evaluation_id, result)
+            },
+            ScriptToConstellationMessage::WebDriverInputComplete(msg_id) => {
+                if let Some(ref reply_sender) = self.webdriver.input_command_response_sender {
+                    reply_sender
+                        .send(WebDriverCommandResponse { id: msg_id })
+                        .unwrap_or_else(|_| {
+                            warn!("Failed to send WebDriverInputComplete {:?}", msg_id);
+                            self.webdriver.input_command_response_sender = None;
+                        });
+                } else {
+                    warn!("No WebDriver input_command_response_sender");
+                }
             },
         }
     }
@@ -2073,17 +2182,6 @@ where
                 Entry::Occupied(entry) => entry,
             };
             match entry.get().state {
-                TransferState::EntangledRemoved => {
-                    // If the entangled port has been removed while this one was in-transfer,
-                    // remove it now.
-                    if let Some(ipc_sender) = self.message_port_routers.get(&router_id) {
-                        let _ = ipc_sender.send(MessagePortMsg::RemoveMessagePort(port_id));
-                    } else {
-                        warn!("No message-port sender for {:?}", router_id);
-                    }
-                    entry.remove_entry();
-                    continue;
-                },
                 TransferState::CompletionInProgress(expected_router_id) => {
                     // Here, the transfer was normally completed.
 
@@ -2107,9 +2205,9 @@ where
 
     fn handle_message_port_transfer_failed(
         &mut self,
-        ports: HashMap<MessagePortId, VecDeque<PortMessageTask>>,
+        ports: HashMap<MessagePortId, PortTransferInfo>,
     ) {
-        for (port_id, mut previous_buffer) in ports.into_iter() {
+        for (port_id, mut transfer_info) in ports.into_iter() {
             let entry = match self.message_ports.remove(&port_id) {
                 None => {
                     warn!(
@@ -2121,11 +2219,6 @@ where
                 Some(entry) => entry,
             };
             let new_info = match entry.state {
-                TransferState::EntangledRemoved => {
-                    // If the entangled port has been removed while this one was in-transfer,
-                    // just drop it.
-                    continue;
-                },
                 TransferState::CompletionFailed(mut current_buffer) => {
                     // The transfer failed,
                     // and now the global has returned us the buffer we previously sent.
@@ -2133,7 +2226,7 @@ where
 
                     // Tasks in the previous buffer are older,
                     // hence need to be added to the front of the current one.
-                    while let Some(task) = previous_buffer.pop_back() {
+                    while let Some(task) = transfer_info.port_message_queue.pop_back() {
                         current_buffer.push_front(task);
                     }
                     // Update the state to transfer-in-progress.
@@ -2152,7 +2245,7 @@ where
 
                     // Tasks in the previous buffer are older,
                     // hence need to be added to the front of the current one.
-                    while let Some(task) = previous_buffer.pop_back() {
+                    while let Some(task) = transfer_info.port_message_queue.pop_back() {
                         current_buffer.push_front(task);
                     }
                     // Forward the buffered message-queue to complete the current transfer.
@@ -2160,7 +2253,10 @@ where
                         if ipc_sender
                             .send(MessagePortMsg::CompletePendingTransfer(
                                 port_id,
-                                current_buffer,
+                                PortTransferInfo {
+                                    port_message_queue: current_buffer,
+                                    disentangled: entry.entangled_with.is_none(),
+                                },
                             ))
                             .is_err()
                         {
@@ -2207,18 +2303,14 @@ where
                 Some(entry) => entry,
             };
             let new_info = match entry.state {
-                TransferState::EntangledRemoved => {
-                    // If the entangled port has been removed while this one was in-transfer,
-                    // remove it now.
-                    if let Some(ipc_sender) = self.message_port_routers.get(&router_id) {
-                        let _ = ipc_sender.send(MessagePortMsg::RemoveMessagePort(port_id));
-                    } else {
-                        warn!("No message-port sender for {:?}", router_id);
-                    }
-                    continue;
-                },
                 TransferState::TransferInProgress(buffer) => {
-                    response.insert(port_id, buffer);
+                    response.insert(
+                        port_id,
+                        PortTransferInfo {
+                            port_message_queue: buffer,
+                            disentangled: entry.entangled_with.is_none(),
+                        },
+                    );
 
                     // If the port was in transfer, and a global is requesting completion,
                     // we note the start of the completion.
@@ -2297,10 +2389,6 @@ where
             TransferState::TransferInProgress(queue) => queue.push_back(task),
             TransferState::CompletionFailed(queue) => queue.push_back(task),
             TransferState::CompletionRequested(_, queue) => queue.push_back(task),
-            TransferState::EntangledRemoved => warn!(
-                "Messageport received a message, but entangled has alread been removed {:?}",
-                port_id
-            ),
         }
     }
 
@@ -2366,59 +2454,6 @@ where
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn handle_remove_messageport(&mut self, port_id: MessagePortId) {
-        let entangled = match self.message_ports.remove(&port_id) {
-            Some(info) => info.entangled_with,
-            None => {
-                return warn!(
-                    "Constellation asked to remove unknown messageport {:?}",
-                    port_id
-                );
-            },
-        };
-        let entangled_id = match entangled {
-            Some(id) => id,
-            None => return,
-        };
-        let info = match self.message_ports.get_mut(&entangled_id) {
-            Some(info) => info,
-            None => {
-                return warn!(
-                    "Constellation asked to remove unknown entangled messageport {:?}",
-                    entangled_id
-                );
-            },
-        };
-        let router_id = match info.state {
-            TransferState::EntangledRemoved => {
-                return warn!(
-                    "Constellation asked to remove entangled messageport by a port that was already removed {:?}",
-                    port_id
-                );
-            },
-            TransferState::TransferInProgress(_) |
-            TransferState::CompletionInProgress(_) |
-            TransferState::CompletionFailed(_) |
-            TransferState::CompletionRequested(_, _) => {
-                // Note: since the port is in-transer, we don't have a router to send it a message
-                // to let it know that its entangled port has been removed.
-                // Hence we mark it so that it will be messaged and removed once the transfer completes.
-                info.state = TransferState::EntangledRemoved;
-                return;
-            },
-            TransferState::Managed(router_id) => router_id,
-        };
-        if let Some(sender) = self.message_port_routers.get(&router_id) {
-            let _ = sender.send(MessagePortMsg::RemoveMessagePort(entangled_id));
-        } else {
-            warn!("No message-port sender for {:?}", router_id);
-        }
-    }
-
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
-    )]
     fn handle_entangle_messageports(&mut self, port1: MessagePortId, port2: MessagePortId) {
         if let Some(info) = self.message_ports.get_mut(&port1) {
             info.entangled_with = Some(port2);
@@ -2433,6 +2468,57 @@ where
         } else {
             warn!(
                 "Constellation asked to entangle unknown messageport: {:?}",
+                port2
+            );
+        }
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
+    /// <https://html.spec.whatwg.org/multipage/#disentangle>
+    fn handle_disentangle_messageports(
+        &mut self,
+        port1: MessagePortId,
+        port2: Option<MessagePortId>,
+    ) {
+        // Disentangle initiatorPort and otherPort,
+        // so that they are no longer entangled or associated with each other.
+        // Note: If `port2` is some, then this is the first message
+        // and `port1` is the initiatorPort, `port2` is the otherPort.
+        // We can immediately remove the initiator.
+        let _ = self.message_ports.remove(&port1);
+
+        // Note: the none case is when otherPort sent this message
+        // in response to completing its own local disentanglement.
+        let Some(port2) = port2 else {
+            return;
+        };
+
+        // Start disentanglement of the other port.
+        if let Some(info) = self.message_ports.get_mut(&port2) {
+            info.entangled_with = None;
+            match &mut info.state {
+                TransferState::Managed(router_id) |
+                TransferState::CompletionInProgress(router_id) => {
+                    // We try to disentangle the other port now,
+                    // and if it has been transfered out by the time the message is received,
+                    // it will be ignored,
+                    // and disentanglement will be completed as part of the transfer.
+                    if let Some(ipc_sender) = self.message_port_routers.get(router_id) {
+                        let _ = ipc_sender.send(MessagePortMsg::CompleteDisentanglement(port2));
+                    } else {
+                        warn!("No message-port sender for {:?}", router_id);
+                    }
+                },
+                _ => {
+                    // Note: the port is in transfer, disentanglement will complete along with it.
+                },
+            }
+        } else {
+            warn!(
+                "Constellation asked to disentangle unknown messageport: {:?}",
                 port2
             );
         }
@@ -3161,6 +3247,22 @@ where
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
+    fn handle_finish_javascript_evaluation(
+        &mut self,
+        evaluation_id: JavaScriptEvaluationId,
+        result: Result<JSValue, JavaScriptEvaluationError>,
+    ) {
+        self.embedder_proxy
+            .send(EmbedderMsg::FinishJavaScriptEvaluation(
+                evaluation_id,
+                result,
+            ));
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn handle_subframe_loaded(&mut self, pipeline_id: PipelineId) {
         let browsing_context_id = match self.pipelines.get(&pipeline_id) {
             Some(pipeline) => pipeline.browsing_context_id,
@@ -3528,15 +3630,24 @@ where
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn handle_tick_animation(&mut self, pipeline_id: PipelineId, tick_type: AnimationTickType) {
-        let pipeline = match self.pipelines.get(&pipeline_id) {
-            Some(pipeline) => pipeline,
-            None => return warn!("{}: Got script tick after closure", pipeline_id),
-        };
+    fn handle_tick_animation(&mut self, webview_ids: Vec<WebViewId>) {
+        let mut animating_event_loops = HashSet::new();
 
-        let message = ScriptThreadMessage::TickAllAnimations(pipeline_id, tick_type);
-        if let Err(e) = pipeline.event_loop.send(message) {
-            self.handle_send_error(pipeline_id, e);
+        for webview_id in webview_ids.iter() {
+            for browsing_context in self.fully_active_browsing_contexts_iter(*webview_id) {
+                let Some(pipeline) = self.pipelines.get(&browsing_context.pipeline_id) else {
+                    continue;
+                };
+                animating_event_loops.insert(pipeline.event_loop.clone());
+            }
+        }
+
+        for event_loop in animating_event_loops {
+            // No error handling here. It's unclear what to do when this fails as the error isn't associated
+            // with a particular pipeline. In addition, the danger of not progressing animations is pretty
+            // low, so it's probably safe to ignore this error and handle the crashed ScriptThread on
+            // some other message.
+            let _ = event_loop.send(ScriptThreadMessage::TickAllAnimations(webview_ids.clone()));
         }
     }
 
@@ -3736,8 +3847,8 @@ where
     fn handle_load_complete_msg(&mut self, webview_id: WebViewId, pipeline_id: PipelineId) {
         let mut webdriver_reset = false;
         if let Some((expected_pipeline_id, ref reply_chan)) = self.webdriver.load_channel {
-            debug!("Sending load for {:?} to WebDriver", expected_pipeline_id);
             if expected_pipeline_id == pipeline_id {
+                debug!("Sending load for {:?} to WebDriver", expected_pipeline_id);
                 let _ = reply_chan.send(WebDriverLoadStatus::Complete);
                 webdriver_reset = true;
             }
@@ -4062,6 +4173,7 @@ where
             }
 
             new_pipeline.set_throttled(false);
+            self.notify_focus_state(new_pipeline_id);
         }
 
         self.update_activity(old_pipeline_id);
@@ -4267,22 +4379,96 @@ where
         feature = "tracing",
         tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
     )]
-    fn handle_focus_msg(&mut self, pipeline_id: PipelineId) {
-        let (browsing_context_id, webview_id) = match self.pipelines.get(&pipeline_id) {
-            Some(pipeline) => (pipeline.browsing_context_id, pipeline.webview_id),
+    fn handle_focus_msg(
+        &mut self,
+        pipeline_id: PipelineId,
+        focused_child_browsing_context_id: Option<BrowsingContextId>,
+        sequence: FocusSequenceNumber,
+    ) {
+        let (browsing_context_id, webview_id) = match self.pipelines.get_mut(&pipeline_id) {
+            Some(pipeline) => {
+                pipeline.focus_sequence = sequence;
+                (pipeline.browsing_context_id, pipeline.webview_id)
+            },
             None => return warn!("{}: Focus parent after closure", pipeline_id),
         };
+
+        // Ignore if the pipeline isn't fully active.
+        if self.get_activity(pipeline_id) != DocumentActivity::FullyActive {
+            debug!(
+                "Ignoring the focus request because pipeline {} is not \
+                fully active",
+                pipeline_id
+            );
+            return;
+        }
 
         // Focus the top-level browsing context.
         self.webviews.focus(webview_id);
         self.embedder_proxy
             .send(EmbedderMsg::WebViewFocused(webview_id));
 
+        // If a container with a non-null nested browsing context is focused,
+        // the nested browsing context's active document becomes the focused
+        // area of the top-level browsing context instead.
+        let focused_browsing_context_id =
+            focused_child_browsing_context_id.unwrap_or(browsing_context_id);
+
+        // Send focus messages to the affected pipelines, except
+        // `pipeline_id`, which has already its local focus state
+        // updated.
+        self.focus_browsing_context(Some(pipeline_id), focused_browsing_context_id);
+    }
+
+    fn handle_focus_remote_document_msg(&mut self, focused_browsing_context_id: BrowsingContextId) {
+        let pipeline_id = match self.browsing_contexts.get(&focused_browsing_context_id) {
+            Some(browsing_context) => browsing_context.pipeline_id,
+            None => return warn!("Browsing context {} not found", focused_browsing_context_id),
+        };
+
+        // Ignore if its active document isn't fully active.
+        if self.get_activity(pipeline_id) != DocumentActivity::FullyActive {
+            debug!(
+                "Ignoring the remote focus request because pipeline {} of \
+                browsing context {} is not fully active",
+                pipeline_id, focused_browsing_context_id,
+            );
+            return;
+        }
+
+        self.focus_browsing_context(None, focused_browsing_context_id);
+    }
+
+    /// Perform [the focusing steps][1] for the active document of
+    /// `focused_browsing_context_id`.
+    ///
+    /// If `initiator_pipeline_id` is specified, this method avoids sending
+    /// a message to `initiator_pipeline_id`, assuming its local focus state has
+    /// already been updated. This is necessary for performing the focusing
+    /// steps for an object that is not the document itself but something that
+    /// belongs to the document.
+    ///
+    /// [1]: https://html.spec.whatwg.org/multipage/#focusing-steps
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
+    fn focus_browsing_context(
+        &mut self,
+        initiator_pipeline_id: Option<PipelineId>,
+        focused_browsing_context_id: BrowsingContextId,
+    ) {
+        let webview_id = match self.browsing_contexts.get(&focused_browsing_context_id) {
+            Some(browsing_context) => browsing_context.top_level_id,
+            None => return warn!("Browsing context {} not found", focused_browsing_context_id),
+        };
+
         // Update the webview’s focused browsing context.
-        match self.webviews.get_mut(webview_id) {
-            Some(webview) => {
-                webview.focused_browsing_context_id = browsing_context_id;
-            },
+        let old_focused_browsing_context_id = match self.webviews.get_mut(webview_id) {
+            Some(browser) => replace(
+                &mut browser.focused_browsing_context_id,
+                focused_browsing_context_id,
+            ),
             None => {
                 return warn!(
                     "{}: Browsing context for focus msg does not exist",
@@ -4291,42 +4477,133 @@ where
             },
         };
 
-        // Focus parent iframes recursively
-        self.focus_parent_pipeline(browsing_context_id);
-    }
+        // The following part is similar to [the focus update steps][1] except
+        // that only `Document`s in the given focus chains are considered. It's
+        // ultimately up to the script threads to fire focus events at the
+        // affected objects.
+        //
+        // [1]: https://html.spec.whatwg.org/multipage/#focus-update-steps
+        let mut old_focus_chain_pipelines: Vec<&Pipeline> = self
+            .ancestor_or_self_pipelines_of_browsing_context_iter(old_focused_browsing_context_id)
+            .collect();
+        let mut new_focus_chain_pipelines: Vec<&Pipeline> = self
+            .ancestor_or_self_pipelines_of_browsing_context_iter(focused_browsing_context_id)
+            .collect();
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
-    )]
-    fn focus_parent_pipeline(&mut self, browsing_context_id: BrowsingContextId) {
-        let parent_pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
-            Some(ctx) => ctx.parent_pipeline_id,
-            None => {
-                return warn!("{}: Focus parent after closure", browsing_context_id);
-            },
-        };
-        let parent_pipeline_id = match parent_pipeline_id {
-            Some(parent_id) => parent_id,
-            None => {
-                return debug!("{}: Focus has no parent", browsing_context_id);
-            },
-        };
+        debug!(
+            "old_focus_chain_pipelines = {:?}",
+            old_focus_chain_pipelines
+                .iter()
+                .map(|p| p.id.to_string())
+                .collect::<Vec<_>>()
+        );
+        debug!(
+            "new_focus_chain_pipelines = {:?}",
+            new_focus_chain_pipelines
+                .iter()
+                .map(|p| p.id.to_string())
+                .collect::<Vec<_>>()
+        );
 
-        // Send a message to the parent of the provided browsing context (if it
-        // exists) telling it to mark the iframe element as focused.
-        let msg = ScriptThreadMessage::FocusIFrame(parent_pipeline_id, browsing_context_id);
-        let (result, parent_browsing_context_id) = match self.pipelines.get(&parent_pipeline_id) {
-            Some(pipeline) => {
-                let result = pipeline.event_loop.send(msg);
-                (result, pipeline.browsing_context_id)
+        // At least the last entries should match. Otherwise something is wrong,
+        // and we don't want to proceed and crash the top-level pipeline by
+        // sending an impossible `Unfocus` message to it.
+        match (
+            &old_focus_chain_pipelines[..],
+            &new_focus_chain_pipelines[..],
+        ) {
+            ([.., p1], [.., p2]) if p1.id == p2.id => {},
+            _ => {
+                warn!("Aborting the focus operation - focus chain sanity check failed");
+                return;
             },
-            None => return warn!("{}: Focus after closure", parent_pipeline_id),
-        };
-        if let Err(e) = result {
-            self.handle_send_error(parent_pipeline_id, e);
         }
-        self.focus_parent_pipeline(parent_browsing_context_id);
+
+        // > If the last entry in `old chain` and the last entry in `new chain`
+        // > are the same, pop the last entry from `old chain` and the last
+        // > entry from `new chain` and redo this step.
+        let mut first_common_pipeline_in_chain = None;
+        while let ([.., p1], [.., p2]) = (
+            &old_focus_chain_pipelines[..],
+            &new_focus_chain_pipelines[..],
+        ) {
+            if p1.id != p2.id {
+                break;
+            }
+            old_focus_chain_pipelines.pop();
+            first_common_pipeline_in_chain = new_focus_chain_pipelines.pop();
+        }
+
+        let mut send_errors = Vec::new();
+
+        // > For each entry `entry` in `old chain`, in order, run these
+        // > substeps: [...]
+        for &pipeline in old_focus_chain_pipelines.iter() {
+            if Some(pipeline.id) != initiator_pipeline_id {
+                let msg = ScriptThreadMessage::Unfocus(pipeline.id, pipeline.focus_sequence);
+                trace!("Sending {:?} to {}", msg, pipeline.id);
+                if let Err(e) = pipeline.event_loop.send(msg) {
+                    send_errors.push((pipeline.id, e));
+                }
+            } else {
+                trace!(
+                    "Not notifying {} - it's the initiator of this focus operation",
+                    pipeline.id
+                );
+            }
+        }
+
+        // > For each entry entry in `new chain`, in reverse order, run these
+        // > substeps: [...]
+        let mut child_browsing_context_id = None;
+        for &pipeline in new_focus_chain_pipelines.iter().rev() {
+            // Don't send a message to the browsing context that initiated this
+            // focus operation. It already knows that it has gotten focus.
+            if Some(pipeline.id) != initiator_pipeline_id {
+                let msg = if let Some(child_browsing_context_id) = child_browsing_context_id {
+                    // Focus the container element of `child_browsing_context_id`.
+                    ScriptThreadMessage::FocusIFrame(
+                        pipeline.id,
+                        child_browsing_context_id,
+                        pipeline.focus_sequence,
+                    )
+                } else {
+                    // Focus the document.
+                    ScriptThreadMessage::FocusDocument(pipeline.id, pipeline.focus_sequence)
+                };
+                trace!("Sending {:?} to {}", msg, pipeline.id);
+                if let Err(e) = pipeline.event_loop.send(msg) {
+                    send_errors.push((pipeline.id, e));
+                }
+            } else {
+                trace!(
+                    "Not notifying {} - it's the initiator of this focus operation",
+                    pipeline.id
+                );
+            }
+            child_browsing_context_id = Some(pipeline.browsing_context_id);
+        }
+
+        if let (Some(pipeline), Some(child_browsing_context_id)) =
+            (first_common_pipeline_in_chain, child_browsing_context_id)
+        {
+            if Some(pipeline.id) != initiator_pipeline_id {
+                // Focus the container element of `child_browsing_context_id`.
+                let msg = ScriptThreadMessage::FocusIFrame(
+                    pipeline.id,
+                    child_browsing_context_id,
+                    pipeline.focus_sequence,
+                );
+                trace!("Sending {:?} to {}", msg, pipeline.id);
+                if let Err(e) = pipeline.event_loop.send(msg) {
+                    send_errors.push((pipeline.id, e));
+                }
+            }
+        }
+
+        for (pipeline_id, e) in send_errors {
+            self.handle_send_error(pipeline_id, e);
+        }
     }
 
     #[cfg_attr(
@@ -4495,6 +4772,7 @@ where
                     NavigationHistoryBehavior::Replace,
                 );
             },
+            // TODO: This should use the ScriptThreadMessage::EvaluateJavaScript command
             WebDriverCommandMsg::ScriptCommand(browsing_context_id, cmd) => {
                 let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
                     Some(browsing_context) => browsing_context.pipeline_id,
@@ -4573,7 +4851,11 @@ where
                 mouse_button,
                 x,
                 y,
+                msg_id,
+                response_sender,
             ) => {
+                self.webdriver.input_command_response_sender = Some(response_sender);
+
                 self.compositor_proxy
                     .send(CompositorMsg::WebDriverMouseButtonEvent(
                         webview_id,
@@ -4581,11 +4863,22 @@ where
                         mouse_button,
                         x,
                         y,
+                        msg_id,
                     ));
             },
-            WebDriverCommandMsg::MouseMoveAction(webview_id, x, y) => {
+            WebDriverCommandMsg::MouseMoveAction(webview_id, x, y, msg_id, response_sender) => {
+                self.webdriver.input_command_response_sender = Some(response_sender);
+
                 self.compositor_proxy
-                    .send(CompositorMsg::WebDriverMouseMoveEvent(webview_id, x, y));
+                    .send(CompositorMsg::WebDriverMouseMoveEvent(
+                        webview_id, x, y, msg_id,
+                    ));
+            },
+            WebDriverCommandMsg::WheelScrollAction(webview, x, y, delta_x, delta_y) => {
+                self.compositor_proxy
+                    .send(CompositorMsg::WebDriverWheelScrollEvent(
+                        webview, x, y, delta_x, delta_y,
+                    ));
             },
             WebDriverCommandMsg::TakeScreenshot(webview_id, rect, response_sender) => {
                 self.compositor_proxy.send(CompositorMsg::CreatePng(
@@ -4921,8 +5214,40 @@ where
             self.trim_history(top_level_id);
         }
 
+        self.notify_focus_state(change.new_pipeline_id);
+
         self.notify_history_changed(change.webview_id);
         self.update_webview_in_compositor(change.webview_id);
+    }
+
+    /// Update the focus state of the specified pipeline that recently became
+    /// active (thus doesn't have a focused container element) and may have
+    /// out-dated information.
+    fn notify_focus_state(&mut self, pipeline_id: PipelineId) {
+        let pipeline = match self.pipelines.get(&pipeline_id) {
+            Some(pipeline) => pipeline,
+            None => return warn!("Pipeline {} is closed", pipeline_id),
+        };
+
+        let is_focused = match self.webviews.get(pipeline.webview_id) {
+            Some(webview) => webview.focused_browsing_context_id == pipeline.browsing_context_id,
+            None => {
+                return warn!(
+                    "Pipeline {}'s top-level browsing context {} is closed",
+                    pipeline_id, pipeline.webview_id
+                );
+            },
+        };
+
+        // If the browsing context is focused, focus the document
+        let msg = if is_focused {
+            ScriptThreadMessage::FocusDocument(pipeline_id, pipeline.focus_sequence)
+        } else {
+            ScriptThreadMessage::Unfocus(pipeline_id, pipeline.focus_sequence)
+        };
+        if let Err(e) = pipeline.event_loop.send(msg) {
+            self.handle_send_error(pipeline_id, e);
+        }
     }
 
     #[cfg_attr(
@@ -5374,7 +5699,29 @@ where
                 None => {
                     warn!("{parent_pipeline_id}: Child closed after parent");
                 },
-                Some(parent_pipeline) => parent_pipeline.remove_child(browsing_context_id),
+                Some(parent_pipeline) => {
+                    parent_pipeline.remove_child(browsing_context_id);
+
+                    // If `browsing_context_id` has focus, focus the parent
+                    // browsing context
+                    if let Some(webview) = self.webviews.get_mut(browsing_context.top_level_id) {
+                        if webview.focused_browsing_context_id == browsing_context_id {
+                            trace!(
+                                "About-to-be-closed browsing context {} is currently focused, so \
+                                focusing its parent {}",
+                                browsing_context_id, parent_pipeline.browsing_context_id
+                            );
+                            webview.focused_browsing_context_id =
+                                parent_pipeline.browsing_context_id;
+                        }
+                    } else {
+                        warn!(
+                            "Browsing context {} contains a reference to \
+                                a non-existent top-level browsing context {}",
+                            browsing_context_id, browsing_context.top_level_id
+                        );
+                    }
+                },
             };
         }
         debug!("{}: Closed", browsing_context_id);

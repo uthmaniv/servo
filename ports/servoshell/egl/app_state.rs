@@ -38,6 +38,14 @@ impl Coordinates {
             viewport: Rect::new(Point2D::new(x, y), Size2D::new(width, height)),
         }
     }
+
+    pub fn origin(&self) -> Point2D<i32, DevicePixel> {
+        self.viewport.origin
+    }
+
+    pub fn size(&self) -> Size2D<i32, DevicePixel> {
+        self.viewport.size
+    }
 }
 
 pub(super) struct ServoWindowCallbacks {
@@ -115,11 +123,13 @@ impl ServoDelegate for ServoShellServoDelegate {
 impl WebViewDelegate for RunningAppState {
     fn screen_geometry(&self, _webview: WebView) -> Option<ScreenGeometry> {
         let coord = self.callbacks.coordinates.borrow();
-        let screen_size = DeviceIntSize::new(coord.viewport.size.width, coord.viewport.size.height);
+        let offset = coord.origin();
+        let available_size = coord.size();
+        let screen_size = coord.size();
         Some(ScreenGeometry {
             size: screen_size,
-            available_size: screen_size,
-            offset: Point2D::zero(),
+            available_size,
+            offset,
         })
     }
 
@@ -527,31 +537,31 @@ impl RunningAppState {
     /// Register a mouse movement.
     pub fn mouse_move(&self, x: f32, y: f32) {
         self.active_webview()
-            .notify_input_event(InputEvent::MouseMove(MouseMoveEvent {
-                point: Point2D::new(x, y),
-            }));
+            .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(Point2D::new(
+                x, y,
+            ))));
         self.perform_updates();
     }
 
     /// Register a mouse button press.
     pub fn mouse_down(&self, x: f32, y: f32, button: MouseButton) {
         self.active_webview()
-            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent {
-                action: MouseButtonAction::Down,
+            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Down,
                 button,
-                point: Point2D::new(x, y),
-            }));
+                Point2D::new(x, y),
+            )));
         self.perform_updates();
     }
 
     /// Register a mouse button release.
     pub fn mouse_up(&self, x: f32, y: f32, button: MouseButton) {
         self.active_webview()
-            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent {
-                action: MouseButtonAction::Up,
+            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Up,
                 button,
-                point: Point2D::new(x, y),
-            }));
+                Point2D::new(x, y),
+            )));
         self.perform_updates();
     }
 
@@ -579,11 +589,11 @@ impl RunningAppState {
     /// Perform a click.
     pub fn click(&self, x: f32, y: f32) {
         self.active_webview()
-            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent {
-                action: MouseButtonAction::Click,
-                button: MouseButton::Left,
-                point: Point2D::new(x, y),
-            }));
+            .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Click,
+                MouseButton::Left,
+                Point2D::new(x, y),
+            )));
         self.perform_updates();
     }
 

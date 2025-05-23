@@ -2,11 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use app_units::Au;
+use app_units::{Au, MAX_AU, MIN_AU};
 use atomic_refcell::AtomicRefCell;
 use base::print_tree::PrintTree;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
+use servo_geometry::f32_rect_to_au_rect;
 use style::Zero;
 use style::computed_values::border_collapse::T as BorderCollapse;
 use style::computed_values::overflow_x::T as ComputedOverflow;
@@ -15,7 +16,9 @@ use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style::values::specified::box_::DisplayOutside;
 
-use super::{BaseFragment, BaseFragmentInfo, CollapsedBlockMargins, Fragment};
+use super::{BaseFragment, BaseFragmentInfo, CollapsedBlockMargins, Fragment, FragmentFlags};
+use crate::SharedStyle;
+use crate::display_list::ToWebRender;
 use crate::formatting_contexts::Baselines;
 use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, ToLogical,
@@ -37,11 +40,9 @@ pub(crate) enum BackgroundMode {
     /// Draw the background normally, getting information from the Fragment style.
     Normal,
 }
-
 #[derive(MallocSizeOf)]
 pub(crate) struct ExtraBackground {
-    #[conditional_malloc_size_of]
-    pub style: ServoArc<ComputedValues>,
+    pub style: SharedStyle,
     pub rect: PhysicalRect<Au>,
 }
 
@@ -57,13 +58,16 @@ pub(crate) enum SpecificLayoutInfo {
 pub(crate) struct BoxFragment {
     pub base: BaseFragment,
 
-    #[conditional_malloc_size_of]
     pub style: ServoArc<ComputedValues>,
     pub children: Vec<Fragment>,
 
     /// The content rect of this fragment in the parent fragment's content rectangle. This
     /// does not include padding, border, or margin -- it only includes content.
     pub content_rect: PhysicalRect<Au>,
+
+    /// This [`BoxFragment`]'s containing block rectangle in coordinates relative to
+    /// the initial containing block, but not taking into account any transforms.
+    pub cumulative_containing_block_rect: PhysicalRect<Au>,
 
     pub padding: PhysicalSides<Au>,
     pub border: PhysicalSides<Au>,
@@ -88,7 +92,7 @@ pub(crate) struct BoxFragment {
     pub scrollable_overflow_from_children: PhysicalRect<Au>,
 
     /// The resolved box insets if this box is `position: sticky`. These are calculated
-    /// during stacking context tree construction because they rely on the size of the
+    /// during `StackingContextTree` construction because they rely on the size of the
     /// scroll container.
     pub(crate) resolved_sticky_insets: AtomicRefCell<Option<PhysicalSides<AuOrAuto>>>,
 
@@ -112,7 +116,7 @@ impl BoxFragment {
     ) -> BoxFragment {
         let scrollable_overflow_from_children =
             children.iter().fold(PhysicalRect::zero(), |acc, child| {
-                acc.union(&child.scrollable_overflow())
+                acc.union(&child.scrollable_overflow_for_parent())
             });
 
         BoxFragment {
@@ -120,6 +124,7 @@ impl BoxFragment {
             style,
             children,
             content_rect,
+            cumulative_containing_block_rect: Default::default(),
             padding,
             border,
             margin,
@@ -195,6 +200,8 @@ impl BoxFragment {
         self
     }
 
+    /// Get the scrollable overflow for this [`BoxFragment`] relative to its
+    /// containing block.
     pub fn scrollable_overflow(&self) -> PhysicalRect<Au> {
         let physical_padding_rect = self.padding_rect();
         let content_origin = self.content_rect.origin.to_vector();
@@ -203,6 +210,14 @@ impl BoxFragment {
                 .scrollable_overflow_from_children
                 .translate(content_origin),
         )
+    }
+
+    pub(crate) fn set_containing_block(&mut self, containing_block: &PhysicalRect<Au>) {
+        self.cumulative_containing_block_rect = *containing_block;
+    }
+
+    pub fn offset_by_containing_block(&self, rect: &PhysicalRect<Au>) -> PhysicalRect<Au> {
+        rect.translate(self.cumulative_containing_block_rect.origin.to_vector())
     }
 
     pub(crate) fn padding_rect(&self) -> PhysicalRect<Au> {
@@ -219,6 +234,16 @@ impl BoxFragment {
 
     pub(crate) fn padding_border_margin(&self) -> PhysicalSides<Au> {
         self.margin + self.border + self.padding
+    }
+
+    pub(crate) fn is_root_element(&self) -> bool {
+        self.base.flags.intersects(FragmentFlags::IS_ROOT_ELEMENT)
+    }
+
+    pub(crate) fn is_body_element_of_html_element_root(&self) -> bool {
+        self.base
+            .flags
+            .intersects(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT)
     }
 
     pub fn print(&self, tree: &mut PrintTree) {
@@ -252,36 +277,99 @@ impl BoxFragment {
 
     pub fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
         let mut overflow = self.border_rect();
-        if self.style.establishes_scroll_container(self.base.flags) {
-            return overflow;
+        if !self.style.establishes_scroll_container(self.base.flags) {
+            // https://www.w3.org/TR/css-overflow-3/#scrollable
+            // Only include the scrollable overflow of a child box if it has overflow: visible.
+            let scrollable_overflow = self.scrollable_overflow();
+            let bottom_right = PhysicalPoint::new(
+                overflow.max_x().max(scrollable_overflow.max_x()),
+                overflow.max_y().max(scrollable_overflow.max_y()),
+            );
+
+            let overflow_style = self.style.effective_overflow(self.base.flags);
+            if overflow_style.y == ComputedOverflow::Visible {
+                overflow.origin.y = overflow.origin.y.min(scrollable_overflow.origin.y);
+                overflow.size.height = bottom_right.y - overflow.origin.y;
+            }
+
+            if overflow_style.x == ComputedOverflow::Visible {
+                overflow.origin.x = overflow.origin.x.min(scrollable_overflow.origin.x);
+                overflow.size.width = bottom_right.x - overflow.origin.x;
+            }
         }
 
-        // https://www.w3.org/TR/css-overflow-3/#scrollable
-        // Only include the scrollable overflow of a child box if it has overflow: visible.
-        let scrollable_overflow = self.scrollable_overflow();
-        let bottom_right = PhysicalPoint::new(
-            overflow.max_x().max(scrollable_overflow.max_x()),
-            overflow.max_y().max(scrollable_overflow.max_y()),
-        );
-
-        let overflow_style = self.style.effective_overflow(self.base.flags);
-        if overflow_style.y == ComputedOverflow::Visible {
-            overflow.origin.y = overflow.origin.y.min(scrollable_overflow.origin.y);
-            overflow.size.height = bottom_right.y - overflow.origin.y;
-        }
-
-        if overflow_style.x == ComputedOverflow::Visible {
-            overflow.origin.x = overflow.origin.x.min(scrollable_overflow.origin.x);
-            overflow.size.width = bottom_right.x - overflow.origin.x;
+        // <https://drafts.csswg.org/css-overflow-3/#scrollable-overflow-region>
+        // > ...accounting for transforms by projecting each box onto the plane of
+        // > the element that establishes its 3D rendering context. [CSS3-TRANSFORMS]
+        // Both boxes and its scrollable overflow (if it is included) should be transformed accordingly.
+        //
+        // TODO(stevennovaryo): We are supposed to handle perspective transform and 3d context, but it is yet to happen.
+        if self
+            .style
+            .has_effective_transform_or_perspective(self.base.flags)
+        {
+            if let Some(transform) =
+                self.calculate_transform_matrix(&self.border_rect().to_untyped())
+            {
+                if let Some(transformed_overflow_box) =
+                    transform.outer_transformed_rect(&overflow.to_webrender().to_rect())
+                {
+                    overflow =
+                        f32_rect_to_au_rect(transformed_overflow_box.to_untyped()).cast_unit();
+                }
+            }
         }
 
         overflow
     }
 
-    pub(crate) fn calculate_resolved_insets_if_positioned(
+    /// <https://drafts.csswg.org/css-overflow/#unreachable-scrollable-overflow-region>
+    /// > area beyond the scroll origin in either axis is considered the unreachable scrollable overflow region
+    ///
+    /// Return the clipped the scrollable overflow based on its scroll origin, determined by overflow direction.
+    /// For an element, the clip rect is the padding rect and for viewport, it is the initial containing block.
+    pub fn clip_unreachable_scrollable_overflow_region(
         &self,
-        containing_block: &PhysicalRect<Au>,
-    ) -> PhysicalSides<AuOrAuto> {
+        scrollable_overflow: PhysicalRect<Au>,
+        clipping_rect: PhysicalRect<Au>,
+    ) -> PhysicalRect<Au> {
+        let scrolling_direction = self.style.overflow_direction();
+        let mut scrollable_overflow_box = scrollable_overflow.to_box2d();
+        let mut clipping_box = clipping_rect.to_box2d();
+
+        if scrolling_direction.rightward {
+            clipping_box.max.x = MAX_AU;
+        } else {
+            clipping_box.min.x = MIN_AU;
+        }
+
+        if scrolling_direction.downward {
+            clipping_box.max.y = MAX_AU;
+        } else {
+            clipping_box.min.y = MIN_AU;
+        }
+
+        scrollable_overflow_box = scrollable_overflow_box.intersection_unchecked(&clipping_box);
+
+        match scrollable_overflow_box.is_negative() {
+            true => PhysicalRect::zero(),
+            false => scrollable_overflow_box.to_rect(),
+        }
+    }
+
+    /// <https://drafts.csswg.org/css-overflow/#unreachable-scrollable-overflow-region>
+    /// > area beyond the scroll origin in either axis is considered the unreachable scrollable overflow region
+    ///
+    /// Return the clipped the scrollable overflow based on its scroll origin, determined by overflow direction.
+    /// This will coincides with the scrollport if the fragment is a scroll container.
+    pub fn reachable_scrollable_overflow_region(&self) -> PhysicalRect<Au> {
+        self.clip_unreachable_scrollable_overflow_region(
+            self.scrollable_overflow(),
+            self.padding_rect(),
+        )
+    }
+
+    pub(crate) fn calculate_resolved_insets_if_positioned(&self) -> PhysicalSides<AuOrAuto> {
         let position = self.style.get_box().position;
         debug_assert_ne!(
             position,
@@ -309,7 +397,10 @@ impl BoxFragment {
         // used value. Otherwise the resolved value is the computed value."
         // https://drafts.csswg.org/cssom/#resolved-values
         let insets = self.style.physical_box_offsets();
-        let (cb_width, cb_height) = (containing_block.width(), containing_block.height());
+        let (cb_width, cb_height) = (
+            self.cumulative_containing_block_rect.width(),
+            self.cumulative_containing_block_rect.height(),
+        );
         if position == ComputedPosition::Relative {
             let get_resolved_axis = |start: &LengthPercentageOrAuto,
                                      end: &LengthPercentageOrAuto,

@@ -90,18 +90,20 @@ use line::{
 use line_breaker::LineBreaker;
 use malloc_size_of_derive::MallocSizeOf;
 use range::Range;
+use script::layout_dom::ServoLayoutNode;
+use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
 use servo_arc::Arc;
 use style::Zero;
 use style::computed_values::text_wrap_mode::T as TextWrapMode;
 use style::computed_values::vertical_align::T as VerticalAlign;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
-use style::context::QuirksMode;
+use style::context::{QuirksMode, SharedStyleContext};
 use style::properties::ComputedValues;
 use style::properties::style_structs::InheritedText;
 use style::values::generics::box_::VerticalAlignKeyword;
 use style::values::generics::font::LineHeight;
 use style::values::specified::box_::BaselineSource;
-use style::values::specified::text::{TextAlignKeyword, TextDecorationLine};
+use style::values::specified::text::TextAlignKeyword;
 use style::values::specified::{TextAlignLast, TextJustify};
 use text_run::{
     TextRun, XI_LINE_BREAKING_CLASS_GL, XI_LINE_BREAKING_CLASS_WJ, XI_LINE_BREAKING_CLASS_ZWJ,
@@ -118,6 +120,7 @@ use super::{
 };
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
+use crate::dom_traversal::NodeAndStyleInfo;
 use crate::flow::CollapsibleWithParentStartMargin;
 use crate::flow::float::{FloatBox, SequentialLayoutState};
 use crate::formatting_contexts::{
@@ -131,7 +134,7 @@ use crate::geom::{LogicalRect, LogicalVec2, ToLogical};
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
 use crate::sizing::{ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult};
 use crate::style_ext::{ComputedValuesExt, PaddingBorderMargin};
-use crate::{ConstraintSpace, ContainingBlock, PropagatedBoxTreeData};
+use crate::{ConstraintSpace, ContainingBlock, SharedStyle};
 
 // From gfxFontConstants.h in Firefox.
 static FONT_SUBSCRIPT_OFFSET_RATIO: f32 = 0.20;
@@ -156,7 +159,9 @@ pub(crate) struct InlineFormattingContext {
     /// context in order to avoid duplicating this information.
     pub font_metrics: Vec<FontKeyAndMetrics>,
 
-    pub(super) text_decoration_line: TextDecorationLine,
+    /// The [`SharedInlineStyles`] for the root of this [`InlineFormattingContext`] that are used to
+    /// share styles with all [`TextRun`] children.
+    pub(super) shared_inline_styles: SharedInlineStyles,
 
     /// Whether this IFC contains the 1st formatted line of an element:
     /// <https://www.w3.org/TR/css-pseudo-4/#first-formatted-line>.
@@ -171,6 +176,25 @@ pub(crate) struct InlineFormattingContext {
     /// Whether or not this is an [`InlineFormattingContext`] has right-to-left content, which
     /// will require reordering during layout.
     pub(super) has_right_to_left_content: bool,
+}
+
+/// [`TextRun`] and `TextFragment`s need a handle on their parent inline box (or inline
+/// formatting context root)'s style. In order to implement incremental layout, these are
+/// wrapped in [`SharedStyle`]. This allows updating the parent box tree element without
+/// updating every single descendant box tree node and fragment.
+#[derive(Clone, Debug, MallocSizeOf)]
+pub(crate) struct SharedInlineStyles {
+    pub style: SharedStyle,
+    pub selected: SharedStyle,
+}
+
+impl From<&NodeAndStyleInfo<'_>> for SharedInlineStyles {
+    fn from(info: &NodeAndStyleInfo) -> Self {
+        Self {
+            style: SharedStyle::new(info.style.clone()),
+            selected: SharedStyle::new(info.get_selected_style()),
+        }
+    }
 }
 
 /// A collection of data used to cache [`FontMetrics`] in the [`InlineFormattingContext`]
@@ -190,15 +214,43 @@ pub(crate) enum InlineItem {
         ArcRefCell<AbsolutelyPositionedBox>,
         usize, /* offset_in_text */
     ),
-    OutOfFlowFloatBox(#[conditional_malloc_size_of] Arc<FloatBox>),
+    OutOfFlowFloatBox(ArcRefCell<FloatBox>),
     Atomic(
-        #[conditional_malloc_size_of] Arc<IndependentFormattingContext>,
+        ArcRefCell<IndependentFormattingContext>,
         usize, /* offset_in_text */
         Level, /* bidi_level */
     ),
 }
 
 impl InlineItem {
+    pub(crate) fn repair_style(
+        &self,
+        context: &SharedStyleContext,
+        node: &ServoLayoutNode,
+        new_style: &Arc<ComputedValues>,
+    ) {
+        match self {
+            InlineItem::StartInlineBox(inline_box) => {
+                inline_box.borrow_mut().repair_style(node, new_style);
+            },
+            InlineItem::EndInlineBox => {},
+            // TextRun holds a handle the `InlineSharedStyles` which is updated when repairing inline box
+            // and `display: contents` styles.
+            InlineItem::TextRun(..) => {},
+            InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => positioned_box
+                .borrow_mut()
+                .context
+                .repair_style(context, node, new_style),
+            InlineItem::OutOfFlowFloatBox(float_box) => float_box
+                .borrow_mut()
+                .contents
+                .repair_style(context, node, new_style),
+            InlineItem::Atomic(atomic, ..) => {
+                atomic.borrow_mut().repair_style(context, node, new_style)
+            },
+        }
+    }
+
     pub(crate) fn invalidate_cached_fragment(&self) {
         match self {
             InlineItem::StartInlineBox(inline_box) => {
@@ -212,11 +264,14 @@ impl InlineItem {
                     .base
                     .invalidate_cached_fragment();
             },
-            InlineItem::OutOfFlowFloatBox(float_box) => {
-                float_box.contents.base.invalidate_cached_fragment()
-            },
+            InlineItem::OutOfFlowFloatBox(float_box) => float_box
+                .borrow()
+                .contents
+                .base
+                .invalidate_cached_fragment(),
             InlineItem::Atomic(independent_formatting_context, ..) => {
                 independent_formatting_context
+                    .borrow()
                     .base
                     .invalidate_cached_fragment();
             },
@@ -232,9 +287,11 @@ impl InlineItem {
             InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
                 positioned_box.borrow().context.base.fragments()
             },
-            InlineItem::OutOfFlowFloatBox(float_box) => float_box.contents.base.fragments(),
+            InlineItem::OutOfFlowFloatBox(float_box) => {
+                float_box.borrow().contents.base.fragments()
+            },
             InlineItem::Atomic(independent_formatting_context, ..) => {
-                independent_formatting_context.base.fragments()
+                independent_formatting_context.borrow().base.fragments()
             },
         }
     }
@@ -569,12 +626,6 @@ pub(super) struct InlineContainerState {
     /// this inline box on the current line OR any previous line.
     has_content: RefCell<bool>,
 
-    /// Indicates whether this nesting level have text decorations in effect.
-    /// From <https://drafts.csswg.org/css-text-decor/#line-decoration>
-    // "When specified on or propagated to a block container that establishes
-    //  an IFC..."
-    text_decoration_line: TextDecorationLine,
-
     /// The block size contribution of this container's default font ie the size of the
     /// "strut." Whether this is integrated into the [`Self::nested_strut_block_sizes`]
     /// depends on the line-height quirk described in
@@ -744,7 +795,7 @@ impl InlineFormattingContextLayout<'_> {
             self.containing_block,
             self.layout_context,
             self.current_inline_container_state(),
-            inline_box.is_last_fragment,
+            inline_box.is_last_split,
             inline_box
                 .default_font_index
                 .map(|index| &self.ifc.font_metrics[index].metrics),
@@ -773,7 +824,7 @@ impl InlineFormattingContextLayout<'_> {
             );
         }
 
-        if inline_box.is_first_fragment {
+        if inline_box.is_first_split {
             self.current_line_segment.inline_size += inline_box_state.pbm.padding.inline_start +
                 inline_box_state.pbm.border.inline_start +
                 inline_box_state.pbm.margin.inline_start.auto_is(Au::zero);
@@ -958,6 +1009,7 @@ impl InlineFormattingContextLayout<'_> {
         .as_physical(Some(self.containing_block));
         self.fragments
             .push(Fragment::Positioning(PositioningFragment::new_anonymous(
+                self.root_nesting_level.style.clone(),
                 physical_line_rect,
                 fragments,
             )));
@@ -1313,7 +1365,7 @@ impl InlineFormattingContextLayout<'_> {
     ) {
         let inline_advance = glyph_store.total_advance();
         let flags = if glyph_store.is_whitespace() {
-            SegmentContentFlags::from(text_run.parent_style.get_inherited_text())
+            SegmentContentFlags::from(text_run.inline_styles.style.borrow().get_inherited_text())
         } else {
             SegmentContentFlags::empty()
         };
@@ -1398,13 +1450,11 @@ impl InlineFormattingContextLayout<'_> {
             TextRunLineItem {
                 text: vec![glyph_store],
                 base_fragment_info: text_run.base_fragment_info,
-                parent_style: text_run.parent_style.clone(),
+                inline_styles: text_run.inline_styles.clone(),
                 font_metrics,
                 font_key: ifc_font_info.key,
-                text_decoration_line: self.current_inline_container_state().text_decoration_line,
                 bidi_level,
                 selection_range,
-                selected_style: text_run.selected_style.clone(),
             },
         ));
     }
@@ -1596,7 +1646,6 @@ impl InlineFormattingContext {
     pub(super) fn new_with_builder(
         builder: InlineFormattingContextBuilder,
         layout_context: &LayoutContext,
-        propagated_data: PropagatedBoxTreeData,
         has_first_formatted_line: bool,
         is_single_line_text_input: bool,
         starting_bidi_level: Level,
@@ -1647,12 +1696,21 @@ impl InlineFormattingContext {
             inline_items: builder.inline_items,
             inline_boxes: builder.inline_boxes,
             font_metrics,
-            text_decoration_line: propagated_data.text_decoration,
+            shared_inline_styles: builder
+                .shared_inline_styles_stack
+                .last()
+                .expect("Should have at least one SharedInlineStyle for the root of an IFC")
+                .clone(),
             has_first_formatted_line,
             contains_floats: builder.contains_floats,
             is_single_line_text_input,
             has_right_to_left_content,
         }
+    }
+
+    pub(crate) fn repair_style(&self, node: &ServoLayoutNode, new_style: &Arc<ComputedValues>) {
+        *self.shared_inline_styles.style.borrow_mut() = new_style.clone();
+        *self.shared_inline_styles.selected.borrow_mut() = node.to_threadsafe().selected_style();
     }
 
     pub(super) fn layout(
@@ -1712,7 +1770,6 @@ impl InlineFormattingContext {
                 style.to_arc(),
                 inline_container_state_flags,
                 None, /* parent_container */
-                self.text_decoration_line,
                 default_font_metrics.as_ref(),
             ),
             inline_box_state_stack: Vec::new(),
@@ -1751,7 +1808,7 @@ impl InlineFormattingContext {
                 InlineItem::EndInlineBox => layout.finish_inline_box(),
                 InlineItem::TextRun(run) => run.borrow().layout_into_line_items(&mut layout),
                 InlineItem::Atomic(atomic_formatting_context, offset_in_text, bidi_level) => {
-                    atomic_formatting_context.layout_into_line_items(
+                    atomic_formatting_context.borrow().layout_into_line_items(
                         &mut layout,
                         *offset_in_text,
                         *bidi_level,
@@ -1766,7 +1823,7 @@ impl InlineFormattingContext {
                     ));
                 },
                 InlineItem::OutOfFlowFloatBox(float_box) => {
-                    float_box.layout_into_line_items(&mut layout);
+                    float_box.borrow().layout_into_line_items(&mut layout);
                 },
             }
         }
@@ -1810,10 +1867,8 @@ impl InlineContainerState {
         style: Arc<ComputedValues>,
         flags: InlineContainerStateFlags,
         parent_container: Option<&InlineContainerState>,
-        parent_text_decoration_line: TextDecorationLine,
         font_metrics: Option<&FontMetrics>,
     ) -> Self {
-        let text_decoration_line = parent_text_decoration_line | style.clone_text_decoration_line();
         let font_metrics = font_metrics.cloned().unwrap_or_else(FontMetrics::empty);
         let line_height = line_height(
             &style,
@@ -1850,7 +1905,6 @@ impl InlineContainerState {
             style,
             flags,
             has_content: RefCell::new(false),
-            text_decoration_line,
             nested_strut_block_sizes: nested_block_sizes,
             strut_block_sizes,
             baseline_offset,
@@ -2004,8 +2058,7 @@ impl IndependentFormattingContext {
         bidi_level: Level,
     ) {
         // We need to know the inline size of the atomic before deciding whether to do the line break.
-        let mut child_positioning_context = PositioningContext::new_for_style(self.style())
-            .unwrap_or_else(|| PositioningContext::new_for_subtree(true));
+        let mut child_positioning_context = PositioningContext::default();
         let IndependentFloatOrAtomicLayoutResult {
             mut fragment,
             baselines,
@@ -2349,10 +2402,10 @@ impl<'layout_data> ContentSizesComputation<'layout_data> {
                     .auto_is(Au::zero);
 
                 let pbm = margin + padding + border;
-                if inline_box.is_first_fragment {
+                if inline_box.is_first_split {
                     self.add_inline_size(pbm.inline_start);
                 }
-                if inline_box.is_last_fragment {
+                if inline_box.is_last_split {
                     self.ending_inline_pbm_stack.push(pbm.inline_end);
                 } else {
                     self.ending_inline_pbm_stack.push(Au::zero());
@@ -2364,8 +2417,9 @@ impl<'layout_data> ContentSizesComputation<'layout_data> {
             },
             InlineItem::TextRun(text_run) => {
                 let text_run = &*text_run.borrow();
+                let parent_style = text_run.inline_styles.style.borrow();
                 for segment in text_run.shaped_text.iter() {
-                    let style_text = text_run.parent_style.get_inherited_text();
+                    let style_text = parent_style.get_inherited_text();
                     let can_wrap = style_text.text_wrap_mode == TextWrapMode::Wrap;
 
                     // TODO: This should take account whether or not the first and last character prevent
@@ -2429,7 +2483,7 @@ impl<'layout_data> ContentSizesComputation<'layout_data> {
                 let InlineContentSizesResult {
                     sizes: outer,
                     depends_on_block_constraints,
-                } = atomic.outer_inline_content_sizes(
+                } = atomic.borrow().outer_inline_content_sizes(
                     self.layout_context,
                     &self.constraint_space.into(),
                     &LogicalVec2::zero(),

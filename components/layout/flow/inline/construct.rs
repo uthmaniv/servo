@@ -6,17 +6,18 @@ use std::borrow::Cow;
 use std::char::{ToLowercase, ToUppercase};
 
 use icu_segmenter::WordSegmenter;
-use servo_arc::Arc;
+use itertools::izip;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::values::specified::text::TextTransformCase;
 use unicode_bidi::Level;
 
 use super::text_run::TextRun;
-use super::{InlineBox, InlineBoxIdentifier, InlineBoxes, InlineFormattingContext, InlineItem};
-use crate::PropagatedBoxTreeData;
+use super::{
+    InlineBox, InlineBoxIdentifier, InlineBoxes, InlineFormattingContext, InlineItem,
+    SharedInlineStyles,
+};
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
-use crate::dom::NodeExt;
 use crate::dom_traversal::NodeAndStyleInfo;
 use crate::flow::float::FloatBox;
 use crate::formatting_contexts::IndependentFormattingContext;
@@ -25,6 +26,12 @@ use crate::style_ext::ComputedValuesExt;
 
 #[derive(Default)]
 pub(crate) struct InlineFormattingContextBuilder {
+    /// A stack of [`SharedInlineStyles`] including one for the root, one for each inline box on the
+    /// inline box stack, and importantly, one for every `display: contents` element that we are
+    /// currently processing. Normally `display: contents` elements don't affect the structure of
+    /// the [`InlineFormattingContext`], but the styles they provide do style their children.
+    pub shared_inline_styles_stack: Vec<SharedInlineStyles>,
+
     /// The collection of text strings that make up this [`InlineFormattingContext`] under
     /// construction.
     pub text_segments: Vec<String>,
@@ -63,9 +70,19 @@ pub(crate) struct InlineFormattingContextBuilder {
     /// The traversal is at all times as deep in the tree as this stack is,
     /// which is why the code doesn't need to keep track of the actual
     /// container root (see `handle_inline_level_element`).
-    ///
+    //_
     /// When an inline box ends, it's removed from this stack.
     inline_box_stack: Vec<InlineBoxIdentifier>,
+
+    /// Normally, an inline box produces a single box tree [`InlineItem`]. When a block
+    /// element causes an inline box [to be split], it can produce multiple
+    /// [`InlineItem`]s, all inserted into different [`InlineFormattingContext`]s.
+    /// [`Self::block_in_inline_splits`] is responsible for tracking all of these split
+    /// inline box results, so that they can be inserted into the [`crate::dom::BoxSlot`]
+    /// for the DOM element once it has been processed for BoxTree construction.
+    ///
+    /// [to be split]: https://www.w3.org/TR/CSS2/visuren.html#anonymous-block-level
+    block_in_inline_splits: Vec<Vec<ArcRefCell<InlineItem>>>,
 
     /// Whether or not the inline formatting context under construction has any
     /// uncollapsible text content.
@@ -73,10 +90,17 @@ pub(crate) struct InlineFormattingContextBuilder {
 }
 
 impl InlineFormattingContextBuilder {
-    pub(crate) fn new() -> Self {
-        // For the purposes of `text-transform: capitalize` the start of the IFC is a word boundary.
+    pub(crate) fn new(info: &NodeAndStyleInfo) -> Self {
+        Self::new_for_shared_styles(vec![info.into()])
+    }
+
+    pub(crate) fn new_for_shared_styles(
+        shared_inline_styles_stack: Vec<SharedInlineStyles>,
+    ) -> Self {
         Self {
+            // For the purposes of `text-transform: capitalize` the start of the IFC is a word boundary.
             on_word_boundary: true,
+            shared_inline_styles_stack,
             ..Default::default()
         }
     }
@@ -88,6 +112,13 @@ impl InlineFormattingContextBuilder {
     fn push_control_character_string(&mut self, string_to_push: &str) {
         self.text_segments.push(string_to_push.to_owned());
         self.current_text_offset += string_to_push.len();
+    }
+
+    fn shared_inline_styles(&self) -> SharedInlineStyles {
+        self.shared_inline_styles_stack
+            .last()
+            .expect("Should always have at least one SharedInlineStyles")
+            .clone()
     }
 
     /// Return true if this [`InlineFormattingContextBuilder`] is empty for the purposes of ignoring
@@ -125,7 +156,7 @@ impl InlineFormattingContextBuilder {
         independent_formatting_context: IndependentFormattingContext,
     ) -> ArcRefCell<InlineItem> {
         let inline_level_box = ArcRefCell::new(InlineItem::Atomic(
-            Arc::new(independent_formatting_context),
+            ArcRefCell::new(independent_formatting_context),
             self.current_text_offset,
             Level::ltr(), /* This will be assigned later if necessary. */
         ));
@@ -156,35 +187,59 @@ impl InlineFormattingContextBuilder {
     }
 
     pub(crate) fn push_float_box(&mut self, float_box: FloatBox) -> ArcRefCell<InlineItem> {
-        let inline_level_box = ArcRefCell::new(InlineItem::OutOfFlowFloatBox(Arc::new(float_box)));
+        let inline_level_box =
+            ArcRefCell::new(InlineItem::OutOfFlowFloatBox(ArcRefCell::new(float_box)));
         self.inline_items.push(inline_level_box.clone());
         self.contains_floats = true;
         inline_level_box
     }
 
-    pub(crate) fn start_inline_box(&mut self, inline_box: InlineBox) -> ArcRefCell<InlineItem> {
+    pub(crate) fn start_inline_box(
+        &mut self,
+        inline_box: InlineBox,
+        block_in_inline_splits: Option<Vec<ArcRefCell<InlineItem>>>,
+    ) {
         self.push_control_character_string(inline_box.base.style.bidi_control_chars().0);
+
+        // Don't push a `SharedInlineStyles` if we are pushing this box when splitting
+        // an IFC for a block-in-inline split. Shared styles are pushed as part of setting
+        // up the second split of the IFC.
+        if inline_box.is_first_split {
+            self.shared_inline_styles_stack
+                .push(inline_box.shared_inline_styles.clone());
+        }
 
         let (identifier, inline_box) = self.inline_boxes.start_inline_box(inline_box);
         let inline_level_box = ArcRefCell::new(InlineItem::StartInlineBox(inline_box));
         self.inline_items.push(inline_level_box.clone());
         self.inline_box_stack.push(identifier);
-        inline_level_box
+
+        let mut block_in_inline_splits = block_in_inline_splits.unwrap_or_default();
+        block_in_inline_splits.push(inline_level_box);
+        self.block_in_inline_splits.push(block_in_inline_splits);
     }
 
-    pub(crate) fn end_inline_box(&mut self) -> ArcRefCell<InlineBox> {
-        let identifier = self.end_inline_box_internal();
+    /// End the ongoing inline box in this [`InlineFormattingContextBuilder`], returning
+    /// shared references to all of the box tree items that were created for it. More than
+    /// a single box tree items may be produced for a single inline box when that inline
+    /// box is split around a block-level element.
+    pub(crate) fn end_inline_box(&mut self) -> Vec<ArcRefCell<InlineItem>> {
+        self.shared_inline_styles_stack.pop();
+
+        let (identifier, block_in_inline_splits) = self.end_inline_box_internal();
         let inline_level_box = self.inline_boxes.get(&identifier);
-        inline_level_box.borrow_mut().is_last_fragment = true;
+        {
+            let mut inline_level_box = inline_level_box.borrow_mut();
+            inline_level_box.is_last_split = true;
+            self.push_control_character_string(inline_level_box.base.style.bidi_control_chars().1);
+        }
 
-        self.push_control_character_string(
-            inline_level_box.borrow().base.style.bidi_control_chars().1,
-        );
-
-        inline_level_box
+        block_in_inline_splits.unwrap_or_default()
     }
 
-    fn end_inline_box_internal(&mut self) -> InlineBoxIdentifier {
+    fn end_inline_box_internal(
+        &mut self,
+    ) -> (InlineBoxIdentifier, Option<Vec<ArcRefCell<InlineItem>>>) {
         let identifier = self
             .inline_box_stack
             .pop()
@@ -193,14 +248,15 @@ impl InlineFormattingContextBuilder {
             .push(ArcRefCell::new(InlineItem::EndInlineBox));
 
         self.inline_boxes.end_inline_box(identifier);
-        identifier
+
+        // This might be `None` if this builder has already drained its block-in-inline-splits
+        // into the new builder on the other side of a new block-in-inline split.
+        let block_in_inline_splits = self.block_in_inline_splits.pop();
+
+        (identifier, block_in_inline_splits)
     }
 
-    pub(crate) fn push_text<'dom, Node: NodeExt<'dom>>(
-        &mut self,
-        text: Cow<'dom, str>,
-        info: &NodeAndStyleInfo<Node>,
-    ) {
+    pub(crate) fn push_text<'dom>(&mut self, text: Cow<'dom, str>, info: &NodeAndStyleInfo<'dom>) {
         let white_space_collapse = info.style.clone_white_space_collapse();
         let collapsed = WhitespaceCollapse::new(
             text.chars(),
@@ -248,8 +304,6 @@ impl InlineFormattingContextBuilder {
         }
 
         let selection_range = info.get_selection_range();
-        let selected_style = info.get_selected_style();
-
         if let Some(last_character) = new_text.chars().next_back() {
             self.on_word_boundary = last_character.is_whitespace();
             self.last_inline_box_ended_with_collapsible_white_space =
@@ -271,18 +325,24 @@ impl InlineFormattingContextBuilder {
             .push(ArcRefCell::new(InlineItem::TextRun(ArcRefCell::new(
                 TextRun::new(
                     info.into(),
-                    info.style.clone(),
+                    self.shared_inline_styles(),
                     new_range,
                     selection_range,
-                    selected_style,
                 ),
             ))));
+    }
+
+    pub(crate) fn enter_display_contents(&mut self, shared_inline_styles: SharedInlineStyles) {
+        self.shared_inline_styles_stack.push(shared_inline_styles);
+    }
+
+    pub(crate) fn leave_display_contents(&mut self) {
+        self.shared_inline_styles_stack.pop();
     }
 
     pub(crate) fn split_around_block_and_finish(
         &mut self,
         layout_context: &LayoutContext,
-        propagated_data: PropagatedBoxTreeData,
         has_first_formatted_line: bool,
         default_bidi_level: Level,
     ) -> Option<InlineFormattingContext> {
@@ -294,13 +354,23 @@ impl InlineFormattingContextBuilder {
         // context. It has the same inline box structure as this builder, except the boxes are
         // marked as not being the first fragment. No inline content is carried over to this new
         // builder.
-        let mut new_builder = InlineFormattingContextBuilder::new();
-        for identifier in self.inline_box_stack.iter() {
+        let mut new_builder = Self::new_for_shared_styles(self.shared_inline_styles_stack.clone());
+
+        let block_in_inline_splits = std::mem::take(&mut self.block_in_inline_splits);
+        for (identifier, historical_inline_boxes) in
+            izip!(self.inline_box_stack.iter(), block_in_inline_splits)
+        {
+            // Start a new inline box for every ongoing inline box in this
+            // InlineFormattingContext once we are done processing this block element,
+            // being sure to give the block-in-inline-split to the new
+            // InlineFormattingContext. These will finally be inserted into the DOM's
+            // BoxSlot once the inline box has been fully processed.
             new_builder.start_inline_box(
                 self.inline_boxes
                     .get(identifier)
                     .borrow()
                     .split_around_block(),
+                Some(historical_inline_boxes),
             );
         }
         let mut inline_builder_from_before_split = std::mem::replace(self, new_builder);
@@ -314,7 +384,6 @@ impl InlineFormattingContextBuilder {
 
         inline_builder_from_before_split.finish(
             layout_context,
-            propagated_data,
             has_first_formatted_line,
             /* is_single_line_text_input = */ false,
             default_bidi_level,
@@ -323,9 +392,8 @@ impl InlineFormattingContextBuilder {
 
     /// Finish the current inline formatting context, returning [`None`] if the context was empty.
     pub(crate) fn finish(
-        &mut self,
+        self,
         layout_context: &LayoutContext,
-        propagated_data: PropagatedBoxTreeData,
         has_first_formatted_line: bool,
         is_single_line_text_input: bool,
         default_bidi_level: Level,
@@ -334,13 +402,10 @@ impl InlineFormattingContextBuilder {
             return None;
         }
 
-        let old_builder = std::mem::replace(self, InlineFormattingContextBuilder::new());
-        assert!(old_builder.inline_box_stack.is_empty());
-
+        assert!(self.inline_box_stack.is_empty());
         Some(InlineFormattingContext::new_with_builder(
-            old_builder,
+            self,
             layout_context,
-            propagated_data,
             has_first_formatted_line,
             is_single_line_text_input,
             default_bidi_level,

@@ -7,7 +7,7 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::sync::{Arc, Mutex};
 use std::{mem, thread};
 
-use compositing_traits::{CrossProcessCompositorApi, SerializableImageData};
+use compositing_traits::{CrossProcessCompositorApi, ImageUpdate, SerializableImageData};
 use imsz::imsz_from_reader;
 use ipc_channel::ipc::IpcSharedMemory;
 use log::{debug, warn};
@@ -66,10 +66,10 @@ fn set_webrender_image_key(compositor_api: &CrossProcessCompositorApi, image: &m
         return;
     }
     let mut bytes = Vec::new();
-    let frame_bytes = image.bytes();
+    let frame_bytes = image.first_frame().bytes;
     let is_opaque = match image.format {
         PixelFormat::BGRA8 => {
-            bytes.extend_from_slice(&frame_bytes);
+            bytes.extend_from_slice(frame_bytes);
             pixels::rgba8_premultiply_inplace(bytes.as_mut_slice())
         },
         PixelFormat::RGB8 => {
@@ -431,7 +431,7 @@ pub struct ImageCacheImpl {
     store: Arc<Mutex<ImageCacheStore>>,
 
     /// Thread pool for image decoding
-    thread_pool: CoreResourceThreadPool,
+    thread_pool: Arc<CoreResourceThreadPool>,
 }
 
 impl ImageCache for ImageCacheImpl {
@@ -454,7 +454,10 @@ impl ImageCache for ImageCacheImpl {
                 placeholder_url: ServoUrl::parse("chrome://resources/rippy.png").unwrap(),
                 compositor_api,
             })),
-            thread_pool: CoreResourceThreadPool::new(thread_count, "ImageCache".to_string()),
+            thread_pool: Arc::new(CoreResourceThreadPool::new(
+                thread_count,
+                "ImageCache".to_string(),
+            )),
         }
     }
 
@@ -650,6 +653,39 @@ impl ImageCache for ImageCacheImpl {
                 }
             },
         }
+    }
+
+    fn create_new_image_cache(
+        &self,
+        compositor_api: CrossProcessCompositorApi,
+    ) -> Arc<dyn ImageCache> {
+        let store = self.store.lock().unwrap();
+        let placeholder_image = store.placeholder_image.clone();
+        let placeholder_url = store.placeholder_url.clone();
+        Arc::new(ImageCacheImpl {
+            store: Arc::new(Mutex::new(ImageCacheStore {
+                pending_loads: AllPendingLoads::new(),
+                completed_loads: HashMap::new(),
+                placeholder_image,
+                placeholder_url,
+                compositor_api,
+            })),
+            thread_pool: self.thread_pool.clone(),
+        })
+    }
+}
+
+impl Drop for ImageCacheStore {
+    fn drop(&mut self) {
+        let image_updates = self
+            .completed_loads
+            .values()
+            .filter_map(|load| match &load.image_response {
+                ImageResponse::Loaded(image, _) => image.id.map(ImageUpdate::DeleteImage),
+                _ => None,
+            })
+            .collect();
+        self.compositor_api.update_images(image_updates);
     }
 }
 

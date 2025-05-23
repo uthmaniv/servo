@@ -34,6 +34,7 @@ no-wgl = ["mozangle/egl", "mozangle/build_dlls", "surfman/sm-angle-default", "co
 dynamic_freetype = ["webrender/dynamic_freetype"]
 profilemozjs = ["script/profilemozjs"]
 refcell_backtrace = ["script/refcell_backtrace"]
+testbinding = ["script/testbinding"]
 tracing = [
     "dep:tracing",
     "compositing/tracing",
@@ -46,14 +47,14 @@ tracing = [
 webdriver = ["webdriver_server"]
 webgl_backtrace = [
     "script/webgl_backtrace",
-    "canvas/webgl_backtrace",
+    "webgl/webgl_backtrace",
     "canvas_traits/webgl_backtrace",
 ]
 webxr = [
     "dep:webxr",
     "dep:webxr-api",
     "compositing/webxr",
-    "canvas/webxr",
+    "webgl/webxr",
     "script/webxr",
 ]
 webgpu = [
@@ -68,9 +69,9 @@ base = { workspace = true }
 bincode = { workspace = true }
 bluetooth = { path = "../bluetooth", optional = true }
 bluetooth_traits = { workspace = true, optional = true }
-canvas = { path = "../canvas", default-features = false }
+canvas = { path = "../canvas" }
+webgl = { path = "../webgl", default-features = false }
 canvas_traits = { workspace = true }
-cfg-if = { workspace = true }
 compositing = { path = "../compositing" }
 compositing_traits = { workspace = true }
 constellation = { path = "../constellation" }
@@ -104,6 +105,7 @@ serde = { workspace = true }
 servo-media = { workspace = true }
 servo-media-dummy = { workspace = true }
 servo-media-gstreamer = { workspace = true, optional = true }
+servo-tracing = { workspace = true }
 servo_allocator = { path = "../allocator" }
 servo_config = { path = "../config" }
 servo_geometry = { path = "../geometry" }
@@ -139,3 +141,12 @@ libservo = { path = ".", features = ["tracing"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tracing = { workspace = true }
 winit = "0.30.8"
+
+
+[[test]]
+name = "webview"
+harness = false
+
+[[test]]
+name = "servo"
+harness = false

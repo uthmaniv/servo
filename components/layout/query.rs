@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use app_units::Au;
 use euclid::default::{Point2D, Rect};
-use euclid::{SideOffsets2D, Size2D, Vector2D};
+use euclid::{SideOffsets2D, Size2D};
 use itertools::Itertools;
+use script::layout_dom::ServoLayoutNode;
 use script_layout_interface::wrapper_traits::{
     LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
@@ -20,7 +21,7 @@ use style::computed_values::position::T as Position;
 use style::computed_values::visibility::T as Visibility;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapseValue;
 use style::context::{QuirksMode, SharedStyleContext, StyleContext, ThreadLocalStyleContext};
-use style::dom::{OpaqueNode, TElement};
+use style::dom::{NodeInfo, OpaqueNode, TElement, TNode};
 use style::properties::style_structs::Font;
 use style::properties::{
     ComputedValues, Importance, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
@@ -38,59 +39,60 @@ use style::values::specified::GenericGridTemplateComponent;
 use style::values::specified::box_::DisplayInside;
 use style_traits::{ParsingMode, ToCss};
 
+use crate::ArcRefCell;
 use crate::dom::NodeExt;
 use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse};
 use crate::fragment_tree::{
-    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, Tag,
+    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
 };
-use crate::geom::{PhysicalRect, PhysicalVec};
 use crate::taffy::SpecificTaffyGridInfo;
 
-pub fn process_content_box_request(
-    requested_node: OpaqueNode,
-    fragment_tree: Option<Arc<FragmentTree>>,
-) -> Option<Rect<Au>> {
-    let rects = fragment_tree?.get_content_boxes_for_node(requested_node);
+pub fn process_content_box_request(node: ServoLayoutNode<'_>) -> Option<Rect<Au>> {
+    let rects: Vec<_> = node
+        .fragments_for_pseudo(None)
+        .iter()
+        .filter_map(Fragment::cumulative_border_box_rect)
+        .collect();
     if rects.is_empty() {
         return None;
     }
 
-    Some(
-        rects
-            .iter()
-            .fold(Rect::zero(), |unioned_rect, rect| rect.union(&unioned_rect)),
-    )
+    Some(rects.iter().fold(Rect::zero(), |unioned_rect, rect| {
+        rect.to_untyped().union(&unioned_rect)
+    }))
 }
 
-pub fn process_content_boxes_request(
-    requested_node: OpaqueNode,
-    fragment_tree: Option<Arc<FragmentTree>>,
-) -> Vec<Rect<Au>> {
-    fragment_tree
-        .map(|tree| tree.get_content_boxes_for_node(requested_node))
+pub fn process_content_boxes_request(node: ServoLayoutNode<'_>) -> Vec<Rect<Au>> {
+    node.fragments_for_pseudo(None)
+        .iter()
+        .filter_map(Fragment::cumulative_border_box_rect)
+        .map(|rect| rect.to_untyped())
+        .collect()
+}
+
+pub fn process_client_rect_request(node: ServoLayoutNode<'_>) -> Rect<i32> {
+    node.fragments_for_pseudo(None)
+        .first()
+        .map(Fragment::client_rect)
         .unwrap_or_default()
-}
-
-pub fn process_node_geometry_request(
-    requested_node: OpaqueNode,
-    fragment_tree: Option<Arc<FragmentTree>>,
-) -> Rect<i32> {
-    if let Some(fragment_tree) = fragment_tree {
-        fragment_tree.get_border_dimensions_for_node(requested_node)
-    } else {
-        Rect::zero()
-    }
 }
 
 /// <https://drafts.csswg.org/cssom-view/#scrolling-area>
 pub fn process_node_scroll_area_request(
-    requested_node: Option<OpaqueNode>,
+    requested_node: Option<ServoLayoutNode<'_>>,
     fragment_tree: Option<Arc<FragmentTree>>,
 ) -> Rect<i32> {
-    let rect = match (fragment_tree, requested_node) {
-        (Some(tree), Some(node)) => tree.get_scrolling_area_for_node(node),
-        (Some(tree), None) => tree.get_scrolling_area_for_viewport(),
-        _ => return Rect::zero(),
+    let Some(tree) = fragment_tree else {
+        return Rect::zero();
+    };
+
+    let rect = match requested_node {
+        Some(node) => node
+            .fragments_for_pseudo(None)
+            .first()
+            .map(Fragment::scrolling_area)
+            .unwrap_or_default(),
+        None => tree.get_scrolling_area_for_viewport(),
     };
 
     Rect::new(
@@ -104,12 +106,11 @@ pub fn process_node_scroll_area_request(
 
 /// Return the resolved value of property for a given (pseudo)element.
 /// <https://drafts.csswg.org/cssom/#resolved-value>
-pub fn process_resolved_style_request<'dom>(
+pub fn process_resolved_style_request(
     context: &SharedStyleContext,
-    node: impl LayoutNode<'dom> + 'dom,
+    node: ServoLayoutNode<'_>,
     pseudo: &Option<PseudoElement>,
     property: &PropertyId,
-    fragment_tree: Option<Arc<FragmentTree>>,
 ) -> String {
     if !node.as_element().unwrap().has_data() {
         return process_resolved_style_request_for_unstyled_node(context, node, pseudo, property);
@@ -161,8 +162,6 @@ pub fn process_resolved_style_request<'dom>(
         _ => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
     };
 
-    let tag_to_find = Tag::new_pseudo(node.opaque(), *pseudo);
-
     // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
     // Here we are trying to conform to the specification that says that getComputedStyle
     // should return the used values in certain circumstances. For size and positional
@@ -191,107 +190,87 @@ pub fn process_resolved_style_request<'dom>(
         return computed_style(None);
     }
 
-    let resolve_for_fragment =
-        |fragment: &Fragment, containing_block: Option<&PhysicalRect<Au>>| {
-            let (content_rect, margins, padding, specific_layout_info) = match fragment {
-                Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
-                    let box_fragment = box_fragment.borrow();
-                    if style.get_box().position != Position::Static {
-                        let resolved_insets = || {
-                            box_fragment
-                                .calculate_resolved_insets_if_positioned(containing_block.unwrap())
-                        };
-                        match longhand_id {
-                            LonghandId::Top => return resolved_insets().top.to_css_string(),
-                            LonghandId::Right => {
-                                return resolved_insets().right.to_css_string();
-                            },
-                            LonghandId::Bottom => {
-                                return resolved_insets().bottom.to_css_string();
-                            },
-                            LonghandId::Left => {
-                                return resolved_insets().left.to_css_string();
-                            },
-                            _ => {},
-                        }
-                    }
-                    let content_rect = box_fragment.content_rect;
-                    let margins = box_fragment.margin;
-                    let padding = box_fragment.padding;
-                    let specific_layout_info = box_fragment.specific_layout_info.clone();
-                    (content_rect, margins, padding, specific_layout_info)
-                },
-                Fragment::Positioning(positioning_fragment) => {
-                    let content_rect = positioning_fragment.borrow().rect;
-                    (
-                        content_rect,
-                        SideOffsets2D::zero(),
-                        SideOffsets2D::zero(),
-                        None,
-                    )
-                },
-                _ => return computed_style(Some(fragment)),
-            };
-
-            // https://drafts.csswg.org/css-grid/#resolved-track-list
-            // > The grid-template-rows and grid-template-columns properties are
-            // > resolved value special case properties.
-            //
-            // > When an element generates a grid container box...
-            if display.inside() == DisplayInside::Grid {
-                if let Some(SpecificLayoutInfo::Grid(info)) = specific_layout_info {
-                    if let Some(value) = resolve_grid_template(&info, style, longhand_id) {
-                        return value;
+    let resolve_for_fragment = |fragment: &Fragment| {
+        let (content_rect, margins, padding, specific_layout_info) = match fragment {
+            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                let box_fragment = box_fragment.borrow();
+                if style.get_box().position != Position::Static {
+                    let resolved_insets = || box_fragment.calculate_resolved_insets_if_positioned();
+                    match longhand_id {
+                        LonghandId::Top => return resolved_insets().top.to_css_string(),
+                        LonghandId::Right => {
+                            return resolved_insets().right.to_css_string();
+                        },
+                        LonghandId::Bottom => {
+                            return resolved_insets().bottom.to_css_string();
+                        },
+                        LonghandId::Left => {
+                            return resolved_insets().left.to_css_string();
+                        },
+                        _ => {},
                     }
                 }
-            }
-
-            // https://drafts.csswg.org/cssom/#resolved-value-special-case-property-like-height
-            // > If the property applies to the element or pseudo-element and the resolved value of the
-            // > display property is not none or contents, then the resolved value is the used value.
-            // > Otherwise the resolved value is the computed value.
-            //
-            // However, all browsers ignore that for margin and padding properties, and resolve to a length
-            // even if the property doesn't apply: https://github.com/w3c/csswg-drafts/issues/10391
-            match longhand_id {
-                LonghandId::Width if resolved_size_should_be_used_value(fragment) => {
-                    content_rect.size.width
-                },
-                LonghandId::Height if resolved_size_should_be_used_value(fragment) => {
-                    content_rect.size.height
-                },
-                LonghandId::MarginBottom => margins.bottom,
-                LonghandId::MarginTop => margins.top,
-                LonghandId::MarginLeft => margins.left,
-                LonghandId::MarginRight => margins.right,
-                LonghandId::PaddingBottom => padding.bottom,
-                LonghandId::PaddingTop => padding.top,
-                LonghandId::PaddingLeft => padding.left,
-                LonghandId::PaddingRight => padding.right,
-                _ => return computed_style(Some(fragment)),
-            }
-            .to_css_string()
+                let content_rect = box_fragment.content_rect;
+                let margins = box_fragment.margin;
+                let padding = box_fragment.padding;
+                let specific_layout_info = box_fragment.specific_layout_info.clone();
+                (content_rect, margins, padding, specific_layout_info)
+            },
+            Fragment::Positioning(positioning_fragment) => {
+                let content_rect = positioning_fragment.borrow().rect;
+                (
+                    content_rect,
+                    SideOffsets2D::zero(),
+                    SideOffsets2D::zero(),
+                    None,
+                )
+            },
+            _ => return computed_style(Some(fragment)),
         };
 
-    if !matches!(
-        longhand_id,
-        LonghandId::Top | LonghandId::Bottom | LonghandId::Left | LonghandId::Right
-    ) {
-        if let Some(fragment) = node.fragments_for_pseudo(*pseudo).first() {
-            return resolve_for_fragment(fragment, None);
-        }
-    }
-
-    fragment_tree
-        .and_then(|fragment_tree| {
-            fragment_tree.find(|fragment, _, containing_block| {
-                if Some(tag_to_find) == fragment.tag() {
-                    Some(resolve_for_fragment(fragment, Some(containing_block)))
-                } else {
-                    None
+        // https://drafts.csswg.org/css-grid/#resolved-track-list
+        // > The grid-template-rows and grid-template-columns properties are
+        // > resolved value special case properties.
+        //
+        // > When an element generates a grid container box...
+        if display.inside() == DisplayInside::Grid {
+            if let Some(SpecificLayoutInfo::Grid(info)) = specific_layout_info {
+                if let Some(value) = resolve_grid_template(&info, style, longhand_id) {
+                    return value;
                 }
-            })
-        })
+            }
+        }
+
+        // https://drafts.csswg.org/cssom/#resolved-value-special-case-property-like-height
+        // > If the property applies to the element or pseudo-element and the resolved value of the
+        // > display property is not none or contents, then the resolved value is the used value.
+        // > Otherwise the resolved value is the computed value.
+        //
+        // However, all browsers ignore that for margin and padding properties, and resolve to a length
+        // even if the property doesn't apply: https://github.com/w3c/csswg-drafts/issues/10391
+        match longhand_id {
+            LonghandId::Width if resolved_size_should_be_used_value(fragment) => {
+                content_rect.size.width
+            },
+            LonghandId::Height if resolved_size_should_be_used_value(fragment) => {
+                content_rect.size.height
+            },
+            LonghandId::MarginBottom => margins.bottom,
+            LonghandId::MarginTop => margins.top,
+            LonghandId::MarginLeft => margins.left,
+            LonghandId::MarginRight => margins.right,
+            LonghandId::PaddingBottom => padding.bottom,
+            LonghandId::PaddingTop => padding.top,
+            LonghandId::PaddingLeft => padding.left,
+            LonghandId::PaddingRight => padding.right,
+            _ => return computed_style(Some(fragment)),
+        }
+        .to_css_string()
+    };
+
+    node.fragments_for_pseudo(*pseudo)
+        .first()
+        .map(resolve_for_fragment)
         .unwrap_or_else(|| computed_style(None))
 }
 
@@ -383,9 +362,9 @@ fn resolve_grid_template(
     }
 }
 
-pub fn process_resolved_style_request_for_unstyled_node<'dom>(
+pub fn process_resolved_style_request_for_unstyled_node(
     context: &SharedStyleContext,
-    node: impl LayoutNode<'dom>,
+    node: ServoLayoutNode<'_>,
     pseudo: &Option<PseudoElement>,
     property: &PropertyId,
 ) -> String {
@@ -450,233 +429,155 @@ fn shorthand_to_css_string(
     }
 }
 
-pub fn process_offset_parent_query(
-    node: OpaqueNode,
-    fragment_tree: Option<Arc<FragmentTree>>,
-) -> OffsetParentResponse {
-    process_offset_parent_query_inner(node, fragment_tree).unwrap_or_default()
+struct OffsetParentFragments {
+    parent: ArcRefCell<BoxFragment>,
+    grandparent: Option<Fragment>,
+}
+
+/// <https://www.w3.org/TR/2016/WD-cssom-view-1-20160317/#dom-htmlelement-offsetparent>
+fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFragments> {
+    // 1. If any of the following holds true return null and terminate this algorithm:
+    //  * The element does not have an associated CSS layout box.
+    //  * The element is the root element.
+    //  * The element is the HTML body element.
+    //  * The element’s computed value of the position property is fixed.
+    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
+    let flags = fragment.base()?.flags;
+    if flags.intersects(
+        FragmentFlags::IS_ROOT_ELEMENT | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+    ) {
+        return None;
+    }
+    if matches!(
+        fragment, Fragment::Box(fragment) if fragment.borrow().style.get_box().position == Position::Fixed
+    ) {
+        return None;
+    }
+
+    // 2.  Return the nearest ancestor element of the element for which at least one of
+    //     the following is true and terminate this algorithm if such an ancestor is found:
+    //  * The computed value of the position property is not static.
+    //  * It is the HTML body element.
+    //  * The computed value of the position property of the element is static and the
+    //    ancestor is one of the following HTML elements: td, th, or table.
+    let mut maybe_parent_node = node.parent_node();
+    while let Some(parent_node) = maybe_parent_node {
+        maybe_parent_node = parent_node.parent_node();
+
+        if let Some(parent_fragment) = parent_node.fragments_for_pseudo(None).first() {
+            let parent_fragment = match parent_fragment {
+                Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => box_fragment,
+                _ => continue,
+            };
+
+            let grandparent_fragment =
+                maybe_parent_node.and_then(|node| node.fragments_for_pseudo(None).first().cloned());
+
+            if parent_fragment.borrow().style.get_box().position != Position::Static {
+                return Some(OffsetParentFragments {
+                    parent: parent_fragment.clone(),
+                    grandparent: grandparent_fragment,
+                });
+            }
+
+            let flags = parent_fragment.borrow().base.flags;
+            if flags.intersects(
+                FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT |
+                    FragmentFlags::IS_TABLE_TH_OR_TD_ELEMENT,
+            ) {
+                return Some(OffsetParentFragments {
+                    parent: parent_fragment.clone(),
+                    grandparent: grandparent_fragment,
+                });
+            }
+        }
+    }
+
+    None
 }
 
 #[inline]
-fn process_offset_parent_query_inner(
-    node: OpaqueNode,
-    fragment_tree: Option<Arc<FragmentTree>>,
-) -> Option<OffsetParentResponse> {
-    let fragment_tree = fragment_tree?;
+pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetParentResponse> {
+    // Only consider the first fragment of the node found as per a
+    // possible interpretation of the specification: "[...] return the
+    // y-coordinate of the top border edge of the first CSS layout box
+    // associated with the element [...]"
+    //
+    // FIXME: Browsers implement this all differently (e.g., [1]) -
+    // Firefox does returns the union of all layout elements of some
+    // sort. Chrome returns the first fragment for a block element (the
+    // same as ours) or the union of all associated fragments in the
+    // first containing block fragment for an inline element. We could
+    // implement Chrome's behavior, but our fragment tree currently
+    // provides insufficient information.
+    //
+    // [1]: https://github.com/w3c/csswg-drafts/issues/4541
+    // > 1. If the element is the HTML body element or does not have any associated CSS
+    //      layout box return zero and terminate this algorithm.
+    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
+    let mut border_box = fragment.cumulative_border_box_rect()?;
 
-    struct NodeOffsetBoxInfo {
-        border_box: Rect<Au>,
-        offset_parent_node_address: Option<OpaqueNode>,
-        is_static_body_element: bool,
-    }
-
-    // https://www.w3.org/TR/2016/WD-cssom-view-1-20160317/#extensions-to-the-htmlelement-interface
-    let mut parent_node_addresses: Vec<Option<(OpaqueNode, bool)>> = Vec::new();
-    let tag_to_find = Tag::new(node);
-    let node_offset_box = fragment_tree.find(|fragment, level, containing_block| {
-        let base = fragment.base()?;
-        let is_body_element = base
-            .flags
-            .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT);
-
-        if fragment.tag() == Some(tag_to_find) {
-            // Only consider the first fragment of the node found as per a
-            // possible interpretation of the specification: "[...] return the
-            // y-coordinate of the top border edge of the first CSS layout box
-            // associated with the element [...]"
-            //
-            // FIXME: Browsers implement this all differently (e.g., [1]) -
-            // Firefox does returns the union of all layout elements of some
-            // sort. Chrome returns the first fragment for a block element (the
-            // same as ours) or the union of all associated fragments in the
-            // first containing block fragment for an inline element. We could
-            // implement Chrome's behavior, but our fragment tree currently
-            // provides insufficient information.
-            //
-            // [1]: https://github.com/w3c/csswg-drafts/issues/4541
-            let fragment_relative_rect = match fragment {
-                Fragment::Box(fragment) | Fragment::Float(fragment) => fragment.borrow().border_rect(),
-                Fragment::Text(fragment) => fragment.borrow().rect,
-                Fragment::Positioning(fragment) => fragment.borrow().rect,
-                Fragment::AbsoluteOrFixedPositioned(_) |
-                Fragment::Image(_) |
-                Fragment::IFrame(_) => unreachable!(),
-            };
-
-            let mut border_box = fragment_relative_rect.translate(containing_block.origin.to_vector()).to_untyped();
-
-            // "If any of the following holds true return null and terminate
-            // this algorithm: [...] The element’s computed value of the
-            // `position` property is `fixed`."
-            let is_fixed = matches!(
-                fragment, Fragment::Box(fragment) if fragment.borrow().style.get_box().position == Position::Fixed
-            );
-
-            if is_body_element {
-                // "If the element is the HTML body element or [...] return zero
-                // and terminate this algorithm."
-                border_box.origin = Point2D::zero();
-            }
-
-            let offset_parent_node = if is_fixed {
-                None
-            } else {
-                // Find the nearest ancestor element eligible as `offsetParent`.
-                parent_node_addresses[..level]
-                    .iter()
-                    .rev()
-                    .cloned()
-                    .find_map(std::convert::identity)
-            };
-
-            Some(NodeOffsetBoxInfo {
-                border_box,
-                offset_parent_node_address: offset_parent_node.map(|node| node.0),
-                is_static_body_element: offset_parent_node.is_some_and(|node| node.1),
-            })
-        } else {
-            // Record the paths of the nodes being traversed.
-            let parent_node_address = match fragment {
-                Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                    let fragment = &*fragment.borrow();
-                    let is_eligible_parent = is_eligible_parent(fragment);
-                    let is_static_body_element = is_body_element &&
-                        fragment.style.get_box().position == Position::Static;
-                    match base.tag {
-                        Some(tag) if is_eligible_parent && !tag.is_pseudo() => {
-                            Some((tag.node, is_static_body_element))
-                        },
-                        _ => None,
-                    }
-                },
-                Fragment::AbsoluteOrFixedPositioned(_) |
-                Fragment::IFrame(_) |
-                Fragment::Image(_) |
-                Fragment::Positioning(_) |
-                Fragment::Text(_) => None,
-            };
-
-            while parent_node_addresses.len() <= level {
-                parent_node_addresses.push(None);
-            }
-            parent_node_addresses[level] = parent_node_address;
-            None
-        }
-    });
-
-    // Bail out if the element doesn't have an associated fragment.
-    // "If any of the following holds true return null and terminate this
-    // algorithm: [...] The element does not have an associated CSS layout box."
-    // (`offsetParent`) "If the element is the HTML body element [...] return
-    // zero and terminate this algorithm." (others)
-    let node_offset_box = node_offset_box?;
-
-    let offset_parent_padding_box_corner = if let Some(offset_parent_node_address) =
-        node_offset_box.offset_parent_node_address
-    {
-        // The spec (https://www.w3.org/TR/cssom-view-1/#extensions-to-the-htmlelement-interface)
-        // says that offsetTop/offsetLeft are always relative to the padding box of the offsetParent.
-        // However, in practice this is not true in major browsers in the case that the offsetParent is the body
-        // element and the body element is position:static. In that case offsetLeft/offsetTop are computed
-        // relative to the root node's border box.
-        if node_offset_box.is_static_body_element {
-            fn extract_box_fragment(
-                fragment: &Fragment,
-                containing_block: &PhysicalRect<Au>,
-            ) -> PhysicalVec<Au> {
-                let (Fragment::Box(fragment) | Fragment::Float(fragment)) = fragment else {
-                    unreachable!();
-                };
-                // Again, take the *first* associated CSS layout box.
-                fragment.borrow().border_rect().origin.to_vector() +
-                    containing_block.origin.to_vector()
-            }
-
-            let containing_block = &fragment_tree.initial_containing_block;
-            let fragment = &fragment_tree.root_fragments[0];
-            if let Fragment::AbsoluteOrFixedPositioned(shared_fragment) = fragment {
-                let shared_fragment = &*shared_fragment.borrow();
-                let fragment = shared_fragment.fragment.as_ref().unwrap();
-                extract_box_fragment(fragment, containing_block)
-            } else {
-                extract_box_fragment(fragment, containing_block)
-            }
-        } else {
-            // Find the top and left padding edges of "the first CSS layout box
-            // associated with the `offsetParent` of the element".
-            //
-            // Since we saw `offset_parent_node_address` once, we should be able
-            // to find it again.
-            let offset_parent_node_tag = Tag::new(offset_parent_node_address);
-            fragment_tree
-                .find(|fragment, _, containing_block| {
-                    match fragment {
-                        Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                            let fragment = fragment.borrow();
-                            if fragment.base.tag == Some(offset_parent_node_tag) {
-                                // Again, take the *first* associated CSS layout box.
-                                let padding_box_corner = fragment.padding_rect().origin.to_vector()
-                                    + containing_block.origin.to_vector();
-                                Some(padding_box_corner)
-                            } else {
-                                None
-                            }
-                        },
-                        Fragment::AbsoluteOrFixedPositioned(_)
-                        | Fragment::Text(_)
-                        | Fragment::Image(_)
-                        | Fragment::IFrame(_)
-                        | Fragment::Positioning(_) => None,
-                    }
-                })
-                .unwrap()
-        }
-    } else {
-        // "If the offsetParent of the element is null," subtract zero in the
-        // following step.
-        Vector2D::zero()
+    // 2.  If the offsetParent of the element is null return the x-coordinate of the left
+    //     border edge of the first CSS layout box associated with the element, relative to
+    //     the initial containing block origin, ignoring any transforms that apply to the
+    //     element and its ancestors, and terminate this algorithm.
+    let Some(offset_parent_fragment) = offset_parent_fragments(node) else {
+        return Some(OffsetParentResponse {
+            node_address: None,
+            rect: border_box.to_untyped(),
+        });
     };
 
+    let parent_fragment = offset_parent_fragment.parent.borrow();
+    let parent_is_static_body_element = parent_fragment
+        .base
+        .flags
+        .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT) &&
+        parent_fragment.style.get_box().position == Position::Static;
+
+    // For `offsetLeft`:
+    // 3. Return the result of subtracting the y-coordinate of the top padding edge of the
+    //    first CSS layout box associated with the offsetParent of the element from the
+    //    y-coordinate of the top border edge of the first CSS layout box associated with the
+    //    element, relative to the initial containing block origin, ignoring any transforms
+    //    that apply to the element and its ancestors.
+    //
+    // We generalize this for `offsetRight` as described in the specification.
+    let grandparent_box_fragment = || match offset_parent_fragment.grandparent {
+        Some(Fragment::Box(box_fragment)) | Some(Fragment::Float(box_fragment)) => {
+            Some(box_fragment)
+        },
+        _ => None,
+    };
+
+    // The spec (https://www.w3.org/TR/cssom-view-1/#extensions-to-the-htmlelement-interface)
+    // says that offsetTop/offsetLeft are always relative to the padding box of the offsetParent.
+    // However, in practice this is not true in major browsers in the case that the offsetParent is the body
+    // element and the body element is position:static. In that case offsetLeft/offsetTop are computed
+    // relative to the root node's border box.
+    //
+    // See <https://github.com/w3c/csswg-drafts/issues/10549>.
+    let parent_offset_rect = if parent_is_static_body_element {
+        if let Some(grandparent_fragment) = grandparent_box_fragment() {
+            let grandparent_fragment = grandparent_fragment.borrow();
+            grandparent_fragment.offset_by_containing_block(&grandparent_fragment.border_rect())
+        } else {
+            parent_fragment.offset_by_containing_block(&parent_fragment.padding_rect())
+        }
+    } else {
+        parent_fragment.offset_by_containing_block(&parent_fragment.padding_rect())
+    };
+
+    border_box = border_box.translate(-parent_offset_rect.origin.to_vector());
+
     Some(OffsetParentResponse {
-        node_address: node_offset_box.offset_parent_node_address.map(Into::into),
-        // "Return the result of subtracting the x-coordinate of the left
-        // padding edge of the first CSS layout box associated with the
-        // `offsetParent` of the element from the x-coordinate of the left
-        // border edge of the first CSS layout box associated with the element,
-        // relative to the initial containing block origin, ignoring any
-        // transforms that apply to the element and its ancestors." (and vice
-        // versa for the top border edge)
-        rect: node_offset_box
-            .border_box
-            .translate(-offset_parent_padding_box_corner.to_untyped()),
+        node_address: parent_fragment.base.tag.map(|tag| tag.node.into()),
+        rect: border_box.to_untyped(),
     })
 }
 
-/// Returns whether or not the element with the given style and body element determination
-/// is eligible to be a parent element for offset* queries.
-///
-/// From <https://www.w3.org/TR/cssom-view-1/#dom-htmlelement-offsetparent>:
-///
-/// > Return the nearest ancestor element of the element for which at least one of the following is
-/// > true and terminate this algorithm if such an ancestor is found:
-/// >   1. The computed value of the position property is not static.
-/// >   2. It is the HTML body element.
-/// >   3. The computed value of the position property of the element is static and the ancestor is
-/// >      one of the following HTML elements: td, th, or table.
-fn is_eligible_parent(fragment: &BoxFragment) -> bool {
-    fragment
-        .base
-        .flags
-        .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT) ||
-        fragment.style.get_box().position != Position::Static ||
-        fragment
-            .base
-            .flags
-            .contains(FragmentFlags::IS_TABLE_TH_OR_TD_ELEMENT)
-}
-
 /// <https://html.spec.whatwg.org/multipage/#get-the-text-steps>
-pub fn get_the_text_steps<'dom>(node: impl LayoutNode<'dom>) -> String {
+pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
     // Step 1: If element is not being rendered or if the user agent is a non-CSS user agent, then
     // return element's descendant text content.
     // This is taken care of in HTMLElemnent code
@@ -764,8 +665,8 @@ impl Default for RenderedTextCollectionState {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#rendered-text-collection-steps>
-fn rendered_text_collection_steps<'dom>(
-    node: impl LayoutNode<'dom>,
+fn rendered_text_collection_steps(
+    node: ServoLayoutNode<'_>,
     state: &mut RenderedTextCollectionState,
 ) -> Vec<InnerOrOuterTextItem> {
     // Step 1. Let items be the result of running the rendered text collection

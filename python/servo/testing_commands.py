@@ -19,6 +19,7 @@ import subprocess
 import textwrap
 import json
 
+import servo.devtools_tests
 from servo.post_build_commands import PostBuildCommands
 import wpt
 import wpt.manifestupdate
@@ -58,7 +59,7 @@ TOML_GLOBS = [
     "*.toml",
     ".cargo/*.toml",
     "components/*/*.toml",
-    "components/shared/*.toml",
+    "components/shared/*/*.toml",
     "ports/*/*.toml",
     "support/*/*.toml",
 ]
@@ -174,6 +175,7 @@ class MachCommands(CommandBase):
             "net",
             "net_traits",
             "pixels",
+            "script_layout_interface",
             "script_traits",
             "selectors",
             "servo_config",
@@ -326,6 +328,14 @@ class MachCommands(CommandBase):
 
         return 0 if passed else 1
 
+    @Command('test-devtools',
+             description='Run tests for devtools.',
+             category='testing')
+    def test_devtools(self):
+        print("Running devtools tests...")
+        passed = servo.devtools_tests.run_tests(SCRIPT_PATH)
+        return 0 if passed else 1
+
     @Command('test-wpt-failure',
              description='Run the tests harness that verifies that the test failures are reported correctly',
              category='testing',
@@ -432,9 +442,9 @@ class MachCommands(CommandBase):
         return [py, avd, apk]
 
     @Command('test-jquery', description='Run the jQuery test suite', category='testing')
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
-    def test_jquery(self, build_type: BuildType):
-        return self.jquery_test_runner("test", build_type)
+    @CommandBase.common_command_arguments(binary_selection=True)
+    def test_jquery(self, servo_binary: str):
+        return self.jquery_test_runner("test", servo_binary)
 
     @Command('test-dromaeo', description='Run the Dromaeo test suite', category='testing')
     @CommandArgument('tests', default=["recommended"], nargs="...", help="Specific tests to run")

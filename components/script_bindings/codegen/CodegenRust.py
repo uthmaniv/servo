@@ -6,6 +6,7 @@
 
 from collections import defaultdict
 from itertools import groupby
+from typing import Generator, Tuple, Optional, List
 
 import operator
 import os
@@ -18,7 +19,9 @@ from WebIDL import (
     BuiltinTypes,
     IDLArgument,
     IDLBuiltinType,
+    IDLCallback,
     IDLDefaultDictionaryValue,
+    IDLDictionary,
     IDLEmptySequenceValue,
     IDLInterface,
     IDLInterfaceMember,
@@ -27,12 +30,16 @@ from WebIDL import (
     IDLObject,
     IDLPromiseType,
     IDLType,
+    IDLTypedef,
     IDLTypedefType,
     IDLUndefinedValue,
     IDLWrapperType,
 )
 
 from Configuration import (
+    Configuration,
+    Descriptor,
+    DescriptorProvider,
     MakeNativeName,
     MemberIsLegacyUnforgeable,
     getModuleFromObject,
@@ -611,16 +618,16 @@ class JSToNativeConversionInfo():
 
 
 def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
-                                isDefinitelyObject=False,
-                                isMember=False,
+                                isDefinitelyObject: bool = False,
+                                isMember: bool | str = False,
                                 isArgument=False,
                                 isAutoRooted=False,
                                 invalidEnumValueFatal=True,
                                 defaultValue=None,
                                 exceptionCode=None,
-                                allowTreatNonObjectAsNull=False,
+                                allowTreatNonObjectAsNull: bool = False,
                                 isCallbackReturnValue=False,
-                                sourceDescription="value"):
+                                sourceDescription="value") -> JSToNativeConversionInfo:
     """
     Get a template for converting a JS value to a native object based on the
     given type and descriptor.  If failureCode is given, then we're actually
@@ -742,6 +749,19 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
                 "}")
         return templateBody
 
+    # A helper function for types that implement FromJSValConvertible trait
+    def fromJSValTemplate(config, errorHandler, exceptionCode):
+        return f"""match FromJSValConvertible::from_jsval(*cx, ${{val}}, {config}) {{
+    Ok(ConversionResult::Success(value)) => value,
+    Ok(ConversionResult::Failure(error)) => {{
+        {errorHandler}
+    }}
+    _ => {{
+        {exceptionCode}
+    }},
+}}
+"""
+
     assert not (isEnforceRange and isClamp)  # These are mutually exclusive
 
     if type.isSequence() or type.isRecord():
@@ -755,13 +775,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         if type.nullable():
             declType = CGWrapper(declType, pre="Option<", post=" >")
 
-        templateBody = (f"match FromJSValConvertible::from_jsval(*cx, ${{val}}, {config}) {{\n"
-                        "    Ok(ConversionResult::Success(value)) => value,\n"
-                        "    Ok(ConversionResult::Failure(error)) => {\n"
-                        f"{indent(failOrPropagate, 8)}\n"
-                        "    }\n"
-                        f"    _ => {{ {exceptionCode} }},\n"
-                        "}")
+        templateBody = fromJSValTemplate(config, failOrPropagate, exceptionCode)
 
         return handleOptional(templateBody, declType, handleDefault("None"))
 
@@ -770,13 +784,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         if type.nullable():
             declType = CGWrapper(declType, pre="Option<", post=" >")
 
-        templateBody = ("match FromJSValConvertible::from_jsval(*cx, ${val}, ()) {\n"
-                        "    Ok(ConversionResult::Success(value)) => value,\n"
-                        "    Ok(ConversionResult::Failure(error)) => {\n"
-                        f"{indent(failOrPropagate, 8)}\n"
-                        "    }\n"
-                        f"    _ => {{ {exceptionCode} }},\n"
-                        "}")
+        templateBody = fromJSValTemplate("()", failOrPropagate, exceptionCode)
 
         dictionaries = [
             memberType
@@ -836,21 +844,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         #    once again be providing a Promise to signal completion of an
         #    operation, which would then not be exposed to anyone other than
         #    our own implementation code.
-        templateBody = fill(
-            """
-            { // Scope for our JSAutoRealm.
-
-                rooted!(in(*cx) let globalObj = CurrentGlobalOrNull(*cx));
-                let promiseGlobal = D::GlobalScope::from_object_maybe_wrapped(globalObj.handle().get(), *cx);
-
-                rooted!(in(*cx) let mut valueToResolve = $${val}.get());
-                if !JS_WrapValue(*cx, valueToResolve.handle_mut()) {
-                $*{exceptionCode}
-                }
-                D::Promise::new_resolved(&promiseGlobal, cx, valueToResolve.handle())
-            }
-            """,
-            exceptionCode=exceptionCode)
+        templateBody = fromJSValTemplate("()", failOrPropagate, exceptionCode)
 
         if isArgument:
             declType = CGGeneric("&D::Promise")
@@ -960,14 +954,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
     if type.isDOMString():
         nullBehavior = getConversionConfigForType(type, isEnforceRange, isClamp, treatNullAs)
 
-        conversionCode = (
-            f"match FromJSValConvertible::from_jsval(*cx, ${{val}}, {nullBehavior}) {{\n"
-            "    Ok(ConversionResult::Success(strval)) => strval,\n"
-            "    Ok(ConversionResult::Failure(error)) => {\n"
-            f"{indent(failOrPropagate, 8)}\n"
-            "    }\n"
-            f"    _ => {{ {exceptionCode} }},\n"
-            "}")
+        conversionCode = fromJSValTemplate(nullBehavior, failOrPropagate, exceptionCode)
 
         if defaultValue is None:
             default = None
@@ -989,14 +976,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
     if type.isUSVString():
         assert not isEnforceRange and not isClamp
 
-        conversionCode = (
-            "match FromJSValConvertible::from_jsval(*cx, ${val}, ()) {\n"
-            "    Ok(ConversionResult::Success(strval)) => strval,\n"
-            "    Ok(ConversionResult::Failure(error)) => {\n"
-            f"{indent(failOrPropagate, 8)}\n"
-            "    }\n"
-            f"    _ => {{ {exceptionCode} }},\n"
-            "}")
+        conversionCode = fromJSValTemplate("()", failOrPropagate, exceptionCode)
 
         if defaultValue is None:
             default = None
@@ -1018,14 +998,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
     if type.isByteString():
         assert not isEnforceRange and not isClamp
 
-        conversionCode = (
-            "match FromJSValConvertible::from_jsval(*cx, ${val}, ()) {\n"
-            "    Ok(ConversionResult::Success(strval)) => strval,\n"
-            "    Ok(ConversionResult::Failure(error)) => {\n"
-            f"{indent(failOrPropagate, 8)}\n"
-            "    }\n"
-            f"    _ => {{ {exceptionCode} }},\n"
-            "}")
+        conversionCode = fromJSValTemplate("()", failOrPropagate, exceptionCode)
 
         if defaultValue is None:
             default = None
@@ -1056,12 +1029,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         else:
             handleInvalidEnumValueCode = "return true;"
 
-        template = (
-            "match FromJSValConvertible::from_jsval(*cx, ${val}, ()) {"
-            f"    Err(_) => {{ {exceptionCode} }},\n"
-            "    Ok(ConversionResult::Success(v)) => v,\n"
-            f"    Ok(ConversionResult::Failure(error)) => {{ {handleInvalidEnumValueCode} }},\n"
-            "}")
+        template = fromJSValTemplate("()", handleInvalidEnumValueCode, exceptionCode)
 
         if defaultValue is not None:
             assert defaultValue.type.tag() == IDLType.Tags.domstring
@@ -1192,14 +1160,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         if type_needs_tracing(type):
             declType = CGTemplatedType("RootedTraceableBox", declType)
 
-        template = (
-            "match FromJSValConvertible::from_jsval(*cx, ${val}, ()) {\n"
-            "    Ok(ConversionResult::Success(dictionary)) => dictionary,\n"
-            "    Ok(ConversionResult::Failure(error)) => {\n"
-            f"{indent(failOrPropagate, 8)}\n"
-            "    }\n"
-            f"    _ => {{ {exceptionCode} }},\n"
-            "}")
+        template = fromJSValTemplate("()", failOrPropagate, exceptionCode)
 
         return handleOptional(template, declType, handleDefault(empty))
 
@@ -1220,14 +1181,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
     if type.nullable():
         declType = CGWrapper(declType, pre="Option<", post=">")
 
-    template = (
-        f"match FromJSValConvertible::from_jsval(*cx, ${{val}}, {conversionBehavior}) {{\n"
-        "    Ok(ConversionResult::Success(v)) => v,\n"
-        "    Ok(ConversionResult::Failure(error)) => {\n"
-        f"{indent(failOrPropagate, 8)}\n"
-        "    }\n"
-        f"    _ => {{ {exceptionCode} }}\n"
-        "}")
+    template = fromJSValTemplate(conversionBehavior, failOrPropagate, exceptionCode)
 
     if defaultValue is not None:
         if isinstance(defaultValue, IDLNullValue):
@@ -2633,7 +2587,12 @@ class CGCallbackTempRoot(CGGeneric):
         CGGeneric.__init__(self, f"{name.replace('<D>', '::<D>')}::new(cx, ${{val}}.get().to_object())")
 
 
-def getAllTypes(descriptors, dictionaries, callbacks, typedefs):
+def getAllTypes(
+    descriptors: List[Descriptor],
+    dictionaries: List[IDLDictionary],
+    callbacks: List[IDLCallback],
+    typedefs: List[IDLTypedef]
+) -> Generator[Tuple[IDLType, Optional[Descriptor]], None, None]:
     """
     Generate all the types we're dealing with.  For each type, a tuple
     containing type, descriptor, dictionary is yielded.  The
@@ -2641,18 +2600,32 @@ def getAllTypes(descriptors, dictionaries, callbacks, typedefs):
     """
     for d in descriptors:
         for t in getTypesFromDescriptor(d):
+            if t.isRecord():
+                yield (t.inner, d)
             yield (t, d)
     for dictionary in dictionaries:
         for t in getTypesFromDictionary(dictionary):
+            if t.isRecord():
+                yield (t.inner, None)
             yield (t, None)
     for callback in callbacks:
         for t in getTypesFromCallback(callback):
+            if t.isRecord():
+                yield (t.inner, None)
             yield (t, None)
     for typedef in typedefs:
+        if typedef.innerType.isRecord():
+            yield (typedef.innerType.inner, None)
         yield (typedef.innerType, None)
 
 
-def UnionTypes(descriptors, dictionaries, callbacks, typedefs, config):
+def UnionTypes(
+    descriptors: List[Descriptor],
+    dictionaries: List[IDLDictionary],
+    callbacks: List[IDLCallback],
+    typedefs: List[IDLTypedef],
+    config: Configuration
+):
     """
     Returns a CGList containing CGUnionStructs for every union.
     """
@@ -5099,7 +5072,7 @@ class CGConstant(CGThing):
         return f"pub const {name}: {const_type} = {value};\n"
 
 
-def getUnionTypeTemplateVars(type, descriptorProvider):
+def getUnionTypeTemplateVars(type, descriptorProvider: DescriptorProvider):
     if type.isGeckoInterface():
         name = type.inner.identifier.name
         typeName = descriptorProvider.getDescriptor(name).returnType
@@ -5136,6 +5109,12 @@ def getUnionTypeTemplateVars(type, descriptorProvider):
     elif type.isCallback():
         name = type.name
         typeName = f"{name}<D>"
+    elif type.isUndefined():
+        return {
+            "name": type.name,
+            "typeName": "()",
+            "jsConversion": CGGeneric("if value.is_undefined() { Ok(Some(())) } else { Ok(None) }")
+        }
     else:
         raise TypeError(f"Can't handle {type} in unions yet")
 
@@ -5201,7 +5180,7 @@ impl{self.generic} Clone for {self.type}{self.genericSuffix} {{
     def manualImpl(self, t, templateVars):
         if t == "Clone":
             return self.manualImplClone(templateVars)
-        raise f"Don't know how to impl {t} for union"
+        raise ValueError(f"Don't know how to impl {t} for union")
 
     def define(self):
         def getTypeWrapper(t):
@@ -5358,31 +5337,44 @@ class CGUnionConversionStruct(CGThing):
         stringTypes = [t for t in memberTypes if t.isString() or t.isEnum()]
         numericTypes = [t for t in memberTypes if t.isNumeric()]
         booleanTypes = [t for t in memberTypes if t.isBoolean()]
-        if stringTypes or numericTypes or booleanTypes:
+        numUndefinedVariants = [t.isUndefined() for t in memberTypes].count(True)
+        if stringTypes or numericTypes or booleanTypes or numUndefinedVariants != 0:
             assert len(stringTypes) <= 1
             assert len(numericTypes) <= 1
             assert len(booleanTypes) <= 1
+            assert numUndefinedVariants <= 1
 
             def getStringOrPrimitiveConversion(memberType):
                 typename = get_name(memberType)
                 return CGGeneric(get_match(typename))
+
             other = []
             stringConversion = list(map(getStringOrPrimitiveConversion, stringTypes))
             numericConversion = list(map(getStringOrPrimitiveConversion, numericTypes))
             booleanConversion = list(map(getStringOrPrimitiveConversion, booleanTypes))
+            undefinedConversion = CGGeneric("return Ok(ConversionResult::Success(Self::Undefined(())));")
+
             if stringConversion:
                 if booleanConversion:
                     other.append(CGIfWrapper("value.get().is_boolean()", booleanConversion[0]))
                 if numericConversion:
                     other.append(CGIfWrapper("value.get().is_number()", numericConversion[0]))
+                if numUndefinedVariants != 0:
+                    other.append(CGIfWrapper("value.get().is_undefined()", undefinedConversion))
                 other.append(stringConversion[0])
             elif numericConversion:
                 if booleanConversion:
                     other.append(CGIfWrapper("value.get().is_boolean()", booleanConversion[0]))
+                if numUndefinedVariants != 0:
+                    other.append(CGIfWrapper("value.get().is_undefined()", undefinedConversion))
                 other.append(numericConversion[0])
-            else:
-                assert booleanConversion
+            elif booleanConversion:
+                if numUndefinedVariants != 0:
+                    other.append(CGIfWrapper("value.get().is_undefined()", undefinedConversion))
                 other.append(booleanConversion[0])
+            else:
+                assert numUndefinedVariants != 0
+                other.append(undefinedConversion)
             conversions.append(CGList(other, "\n\n"))
         conversions.append(CGGeneric(
             f'Ok(ConversionResult::Failure("argument could not be converted to any of: {", ".join(names)}".into()))'
@@ -5404,6 +5396,10 @@ class CGUnionConversionStruct(CGThing):
             post="\n}")
 
     def try_method(self, t):
+        if t.isUndefined():
+            # undefined does not require a conversion method, so we don't generate one
+            return CGGeneric("")
+
         templateVars = getUnionTypeTemplateVars(t, self.descriptorProvider)
         actualType = templateVars["typeName"]
         if type_needs_tracing(t):
@@ -7179,7 +7175,7 @@ impl{self.generic} Clone for {self.makeClassName(self.dictionary)}{self.genericS
     def manualImpl(self, t):
         if t == "Clone":
             return self.manualImplClone()
-        raise f"Don't know how to impl {t} for dicts."
+        raise ValueError(f"Don't know how to impl {t} for dicts.")
 
     def struct(self):
         d = self.dictionary

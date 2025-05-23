@@ -12,7 +12,6 @@ use std::{f64, mem};
 use compositing_traits::{CrossProcessCompositorApi, ImageUpdate, SerializableImageData};
 use content_security_policy as csp;
 use dom_struct::dom_struct;
-use embedder_traits::resources::{self, Resource as EmbedderResource};
 use embedder_traits::{MediaPositionState, MediaSessionEvent, MediaSessionPlaybackState};
 use euclid::default::Size2D;
 use headers::{ContentLength, ContentRange, HeaderMapExt};
@@ -109,6 +108,12 @@ use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
 use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
+
+/// A CSS file to style the media controls.
+static MEDIA_CONTROL_CSS: &str = include_str!("../resources/media-controls.css");
+
+/// A JS file to control the media controls.
+static MEDIA_CONTROL_JS: &str = include_str!("../resources/media-controls.js");
 
 #[derive(PartialEq)]
 enum FrameStatus {
@@ -1364,7 +1369,6 @@ impl HTMLMediaElement {
             .lock()
             .unwrap()
             .render_poster_frame(image);
-        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
 
         if pref!(media_testing_enabled) {
             self.owner_global()
@@ -1613,7 +1617,6 @@ impl HTMLMediaElement {
                 // TODO: 6. Abort the overall resource selection algorithm.
             },
             PlayerEvent::VideoFrameUpdated => {
-                self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
                 // Check if the frame was resized
                 if let Some(frame) = self.video_renderer.lock().unwrap().current_frame {
                     self.handle_resize(Some(frame.width as u32), Some(frame.height as u32));
@@ -1949,14 +1952,13 @@ impl HTMLMediaElement {
             ElementCreator::ScriptCreated,
             can_gc,
         );
-        let mut media_controls_script = resources::read_string(EmbedderResource::MediaControlsJS);
         // This is our hacky way to temporarily workaround the lack of a privileged
         // JS context.
         // The media controls UI accesses the document.servoGetMediaControls(id) API
         // to get an instance to the media controls ShadowRoot.
         // `id` needs to match the internally generated UUID assigned to a media element.
         let id = document.register_media_controls(&shadow_root);
-        let media_controls_script = media_controls_script.as_mut_str().replace("@@@id@@@", &id);
+        let media_controls_script = MEDIA_CONTROL_JS.replace("@@@id@@@", &id);
         *self.media_controls_id.borrow_mut() = Some(id);
         script
             .upcast::<Node>()
@@ -1969,7 +1971,6 @@ impl HTMLMediaElement {
             return;
         }
 
-        let media_controls_style = resources::read_string(EmbedderResource::MediaControlsCSS);
         let style = HTMLStyleElement::new(
             local_name!("script"),
             None,
@@ -1980,7 +1981,7 @@ impl HTMLMediaElement {
         );
         style
             .upcast::<Node>()
-            .SetTextContent(Some(DOMString::from(media_controls_style)), can_gc);
+            .SetTextContent(Some(DOMString::from(MEDIA_CONTROL_CSS)), can_gc);
 
         if let Err(e) = shadow_root
             .upcast::<Node>()
@@ -2014,12 +2015,12 @@ impl HTMLMediaElement {
     pub(crate) fn clear_current_frame_data(&self) {
         self.handle_resize(None, None);
         self.video_renderer.lock().unwrap().current_frame = None;
-        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
     }
 
     fn handle_resize(&self, width: Option<u32>, height: Option<u32>) {
         if let Some(video_elem) = self.downcast::<HTMLVideoElement>() {
             video_elem.resize(width, height);
+            self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
         }
     }
 
@@ -2948,7 +2949,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations);
+        global.report_csp_violations(violations, None);
     }
 }
 
